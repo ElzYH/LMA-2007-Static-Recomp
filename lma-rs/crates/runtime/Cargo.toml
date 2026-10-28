@@ -1,0 +1,41 @@
+[package]
+name = "runtime"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+bincode = "1.3"
+corosensei = "0.3"
+guest = { version = "0.1.0", path = "../guest" }
+lma-data = { version = "0.1.0", path = "../lma-data" }
+lz4_flex = "0.14.0"
+png = "0.17"
+ppc = { version = "0.1.0", path = "../ppc" }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1"
+xex = { version = "0.1.0", path = "../xex" }
+wgpu = { version = "29.0.4", optional = true }
+futures-lite = { version = "2.6.1", optional = true }
+# Tracy profiler zones (`zone!`); its spans are no-ops unless the `tracy` feature enables it
+tracy-client = { version = "0.18", default-features = false, optional = true }
+
+[features]
+# GPU rendering backend (#6): pixel work on D3D12/Vulkan/Metal through wgpu
+wgpu = ["dep:wgpu", "dep:futures-lite"]
+# wgpu's live object counts in the LMA_GPU_COUNTERS=1 log (#746)
+gpu-counters = ["wgpu", "wgpu/counters"]
+# Tracy profiling (frame timing zones): build with --features tracy and run the Tracy viewer
+tracy = ["dep:tracy-client", "tracy-client/enable"]
+# guest read watch for analysis runs (LMA_RWATCH in lma-cli)
+rwatch = ["guest/rwatch"]
+# XMA audio decoding through FFmpeg's libavcodec (#199): needs FFmpeg's headers and libraries
+# (Homebrew's on the Mac; FFMPEG_DIR points elsewhere). Without it, XMA sounds stay silent.
+xma-ffmpeg = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[dev-dependencies]
+lma-data = { version = "0.1.0", path = "../lma-data", features = ["test-fixtures"] }
+# validates the backend's built-in WGSL (reserved words etc.) without a GPU
+naga = { version = "29.0.4", features = ["wgsl-in"] }

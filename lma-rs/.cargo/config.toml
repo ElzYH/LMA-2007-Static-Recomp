@@ -1,0 +1,8 @@
+# Per-target build settings for everyone (#43). Per-machine settings such as sccache go in the
+# user's own ~/.cargo/config.toml, not here (see CLAUDE.md "Building").
+
+# Windows MSVC target only: link with rust-lld (ships with the Rust toolchain), much faster than
+# link.exe on the large binaries. The PC builds with x86_64-pc-windows-gnu and keeps that
+# target's default linker; macOS keeps Apple's default ld-prime, already fast.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

@@ -1,0 +1,13 @@
+[package]
+name = "recomp"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "lma-recomp"
+path = "src/main.rs"
+
+[dependencies]
+ppc = { path = "../ppc" }
+xex = { path = "../xex" }
+guest = { path = "../guest" }

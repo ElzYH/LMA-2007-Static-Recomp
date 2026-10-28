@@ -1,0 +1,16 @@
+[package]
+name = "guest"
+edition.workspace = true
+version.workspace = true
+description = "Guest CPU state, interpreter, memory and the helpers recompiled code calls: the stable interface the generated game-blocks parts depend on, so most runtime changes don't rebuild them."
+
+[dependencies]
+ppc = { version = "0.1.0", path = "../ppc" }
+serde = { version = "1.0.229", features = ["derive"] }
+
+[target.'cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
+[features]
+# LMA_RWATCH (analysis builds only): count guest loads of one word, reported by the dispatcher
+rwatch = []

@@ -1,0 +1,24 @@
+[package]
+name = "lma-app"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+bevy = "0.19"
+cpal = "0.17"
+runtime = { version = "0.1.0", path = "../runtime", features = ["wgpu"] }
+game-blocks = { path = "../game-blocks" }
+png = "0.17"
+# the window icon (#766): winit's Icon type, the same winit bevy_winit uses
+winit = { version = "0.30", default-features = false }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+xex = { version = "0.1.0", path = "../xex" }
+# the first run reads the player's disc (#766 b)
+lma-data = { version = "0.1.0", path = "../lma-data" }
+
+[features]
+# Tracy profiler zones and frame marks (zero cost when off)
+tracy = ["runtime/tracy"]
+# XMA audio through FFmpeg (#199; see runtime's feature)
+xma-ffmpeg = ["runtime/xma-ffmpeg"]

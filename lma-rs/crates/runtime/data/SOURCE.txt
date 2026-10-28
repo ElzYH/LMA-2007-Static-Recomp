@@ -1,0 +1,2 @@
+Ordinal tables derived from Xenia (BSD-3-Clause), https://github.com/xenia-canary/xenia-canary
+gpu_regs.txt from Xenia register_table.inc (BSD-3-Clause)

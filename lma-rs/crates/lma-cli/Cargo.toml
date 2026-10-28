@@ -1,0 +1,22 @@
+[package]
+name = "lma-cli"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+lma-data = { version = "0.1.0", path = "../lma-data" }
+png = "0.17"
+ppc = { version = "0.1.0", path = "../ppc" }
+runtime = { version = "0.1.0", path = "../runtime", features = ["wgpu"] }
+guest = { version = "0.1.0", path = "../guest" }
+game-blocks = { path = "../game-blocks" }
+xex = { version = "0.1.0", path = "../xex" }
+naga = { version = "29.0.4", features = ["wgsl-in"] }
+lma-import = { version = "0.1.0", path = "../lma-import" }
+toml = "1"
+
+[features]
+# XMA audio through FFmpeg (#199; see runtime's feature)
+xma-ffmpeg = ["runtime/xma-ffmpeg"]
+# LMA_RWATCH=<hex addr>: report guest loads of that word with the pc of the next check point
+rwatch = ["runtime/rwatch", "guest/rwatch"]

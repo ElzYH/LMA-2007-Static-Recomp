@@ -1,0 +1,111 @@
+[workspace]
+resolver = "2"
+members = ["crates/lma-data", "crates/lma-cli", "crates/xex", "crates/ppc", "crates/guest", "crates/runtime", "crates/lma-app", "crates/recomp", "crates/game-blocks", "crates/lma-import"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+# Quick iteration on the recompiler or the guest crate: like release, but the 32 generated
+# game-block parts (by far the slowest to compile) unoptimised. M4 Max: a guest change rebuilds
+# in 26 s instead of 164 s; the game runs at ~210 instead of ~740 M instr/s. Benchmarks use
+# --release. (opt-level 1 was slower to build than release for these huge functions.)
+#   cargo build --profile fast-dev -p lma-cli -p lma-app   (output in target/fast-dev/)
+[profile.fast-dev]
+inherits = "release"
+
+[profile.fast-dev.package.gb00]
+opt-level = 0
+
+[profile.fast-dev.package.gb01]
+opt-level = 0
+
+[profile.fast-dev.package.gb02]
+opt-level = 0
+
+[profile.fast-dev.package.gb03]
+opt-level = 0
+
+[profile.fast-dev.package.gb04]
+opt-level = 0
+
+[profile.fast-dev.package.gb05]
+opt-level = 0
+
+[profile.fast-dev.package.gb06]
+opt-level = 0
+
+[profile.fast-dev.package.gb07]
+opt-level = 0
+
+[profile.fast-dev.package.gb08]
+opt-level = 0
+
+[profile.fast-dev.package.gb09]
+opt-level = 0
+
+[profile.fast-dev.package.gb10]
+opt-level = 0
+
+[profile.fast-dev.package.gb11]
+opt-level = 0
+
+[profile.fast-dev.package.gb12]
+opt-level = 0
+
+[profile.fast-dev.package.gb13]
+opt-level = 0
+
+[profile.fast-dev.package.gb14]
+opt-level = 0
+
+[profile.fast-dev.package.gb15]
+opt-level = 0
+
+[profile.fast-dev.package.gb16]
+opt-level = 0
+
+[profile.fast-dev.package.gb17]
+opt-level = 0
+
+[profile.fast-dev.package.gb18]
+opt-level = 0
+
+[profile.fast-dev.package.gb19]
+opt-level = 0
+
+[profile.fast-dev.package.gb20]
+opt-level = 0
+
+[profile.fast-dev.package.gb21]
+opt-level = 0
+
+[profile.fast-dev.package.gb22]
+opt-level = 0
+
+[profile.fast-dev.package.gb23]
+opt-level = 0
+
+[profile.fast-dev.package.gb24]
+opt-level = 0
+
+[profile.fast-dev.package.gb25]
+opt-level = 0
+
+[profile.fast-dev.package.gb26]
+opt-level = 0
+
+[profile.fast-dev.package.gb27]
+opt-level = 0
+
+[profile.fast-dev.package.gb28]
+opt-level = 0
+
+[profile.fast-dev.package.gb29]
+opt-level = 0
+
+[profile.fast-dev.package.gb30]
+opt-level = 0
+
+[profile.fast-dev.package.gb31]
+opt-level = 0

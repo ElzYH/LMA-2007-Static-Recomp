@@ -1,0 +1,10 @@
+[package]
+name = "lma-import"
+edition.workspace = true
+version.workspace = true
+description = "Imports real-world squads (EA FC rosters, FM attributes) into an LMA mod space (#20)"
+
+[dependencies]
+lma-data = { path = "../lma-data" }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1"

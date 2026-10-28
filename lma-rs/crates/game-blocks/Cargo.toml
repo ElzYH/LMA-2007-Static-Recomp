@@ -1,0 +1,40 @@
+[package]
+name = "game-blocks"
+edition.workspace = true
+version.workspace = true
+description = "Recompiled game code. This committed version is a placeholder over 32 empty stub parts: run lma-recomp to generate the real parts from your own default.xex."
+
+[dependencies]
+guest = { path = "../guest" }
+gb00 = { path = "stubs/gb00" }
+gb01 = { path = "stubs/gb01" }
+gb02 = { path = "stubs/gb02" }
+gb03 = { path = "stubs/gb03" }
+gb04 = { path = "stubs/gb04" }
+gb05 = { path = "stubs/gb05" }
+gb06 = { path = "stubs/gb06" }
+gb07 = { path = "stubs/gb07" }
+gb08 = { path = "stubs/gb08" }
+gb09 = { path = "stubs/gb09" }
+gb10 = { path = "stubs/gb10" }
+gb11 = { path = "stubs/gb11" }
+gb12 = { path = "stubs/gb12" }
+gb13 = { path = "stubs/gb13" }
+gb14 = { path = "stubs/gb14" }
+gb15 = { path = "stubs/gb15" }
+gb16 = { path = "stubs/gb16" }
+gb17 = { path = "stubs/gb17" }
+gb18 = { path = "stubs/gb18" }
+gb19 = { path = "stubs/gb19" }
+gb20 = { path = "stubs/gb20" }
+gb21 = { path = "stubs/gb21" }
+gb22 = { path = "stubs/gb22" }
+gb23 = { path = "stubs/gb23" }
+gb24 = { path = "stubs/gb24" }
+gb25 = { path = "stubs/gb25" }
+gb26 = { path = "stubs/gb26" }
+gb27 = { path = "stubs/gb27" }
+gb28 = { path = "stubs/gb28" }
+gb29 = { path = "stubs/gb29" }
+gb30 = { path = "stubs/gb30" }
+gb31 = { path = "stubs/gb31" }

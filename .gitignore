@@ -1,0 +1,38 @@
+# ---- never commit game content (copyrighted, from the user's own disc) ----
+lab/
+LMA_full/
+extracted/
+dumps/
+work/
+lab_extract.log
+*.iso
+*.xex
+*.mng
+*.pe
+*.dmp
+# mod spaces (CSVs derived from the game database), reference frames/states: any depth
+**/mods/
+**/refs/
+**/states/
+
+# ---- generated from the user's default.xex by lma-recomp (placeholders are committed) ----
+lma-rs/crates/game-blocks/parts/
+
+# ---- build output, runtime output, save states ----
+target/
+target-*/
+states/
+frames/
+nightly_out/
+capture/
+userdata/
+shots/
+last_run.log
+misses.txt
+*.state
+frame_*.png
+.DS_Store
+__pycache__/
+.claude/*
+!.claude/settings.json
+pixel_trace.txt

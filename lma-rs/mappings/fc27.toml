@@ -1,0 +1,717 @@
+# Default mapping: EA SPORTS FC 27 roster CSV (Kaggle "EA SPORTS FC 27 Player Ratings" columns)
+# -> LMA Manager 2007 squads. Data-free: only column names, position labels and club/nation
+# name aliases. Copy it next to your mod and edit freely; `lma-cli squad-import` reads it.
+
+season_start = "2026-07-01"
+# The season the game itself starts in, written to the mod's mod.toml (#390: dates, season labels
+# and contract years count from it). On since 10 Oct (decision timeout on the maintainer's question, the
+# Mac's yes): the game boots to WED 1 JUL '26.
+base_year = 2026
+# GBP per unit of the stored value (#475's runtime): 5,000 lifts the cap from GBP 65.5m to 327.7m,
+# so Transfermarkt values fit (the maintainer, 11 Oct: Yamal EUR 200m+, Saka 110m, values on the funds' scale)
+value_unit = 5000
+# gate receipts, sponsorship and prize money x4 (2006 -> 2026 club income; the maintainer, 11 Oct)
+income_scale = 4.0
+# a player is worth his stored (Transfermarkt) value, not the game's rating-based price (the maintainer, 11 Oct)
+values_as_stored = true
+# the board lends all of a club's funds for transfers, not 65% (#522; the maintainer, 11 Oct: offers capped at
+# 80m of 198m), so the funds are the FC 27 budgets themselves (transfer_share below)
+board_share = 1.0
+# the clubs' weekly wage budget cap, GBP 3.2m in 2006, for real wages (wages.csv)
+wage_budget_cap = 10000000
+# the contract screen's most a club may offer a week by status (vanilla 100k / 50k / 25k / 10k /
+# 10k / 5k: the maintainer's 100k board limit, 12 Oct); at most 524,287 (a 19-bit field)
+contract_wage_ceilings = [500000, 300000, 150000, 80000, 40000, 20000]
+# each club's wage budget is at least its real squad bill x this (wage_budgets.csv): room to offer
+# and re-sign stars (the maintainer, 11 Oct: the board allowed ~100k)
+wage_headroom = 1.5
+max_squad = 32
+# each club keeps its real squad up to max_squad, from spare player records while they last (#538)
+real_squads = true
+# and players beyond the 32 kept outside the squad array (squad_overflow.csv, #538)
+squad_overflow = true
+
+# players the live squads list at our clubs but FC 27 lacks are added from Transfermarkt (the maintainer, 12 Oct:
+# "add some players not in the game like Max Dowman")
+live_add_missing = true
+# only players valued EUR 1m or more: each one added takes a spare record from a free agent
+live_add_min_value_eur = 1000000
+filter_column = "gender"
+filter_value = "Men's Football"
+# empty = every league in the roster file
+leagues = []
+
+[columns]
+forename = "first_name"
+surname = "last_name"
+common_name = "common_name"
+birthdate = "birthdate"
+club = "club"
+league = "league"
+nationality = "nationality"
+position = "position"
+alt_positions = "alternate_positions"
+overall = "overall_rating"
+height_cm = "height_cm"
+foot = "preferred_foot"
+weak_foot = "weak_foot"
+
+# LMA rating = average of the listed FC columns (1-99), or a constant.
+[ratings]
+tackling = ["defending_standing_tackle", "defending_sliding_tackle"]
+marking = ["defending_awareness"]
+passing = ["attacking_short_passing", "skill_long_passing"]
+technique = ["skill_ball_control"]
+dribbling = ["skill_dribbling", "movement_agility"]
+shot_power = ["power_shot_power"]
+shot_accuracy = ["attacking_finishing"]
+heading = ["attacking_heading_accuracy"]
+positioning = ["mentality_interceptions", "defending_awareness"]
+runs = ["mentality_positioning"]
+creativity = ["mentality_vision"]
+pace = ["movement_acceleration", "movement_sprint_speed"]
+intelligence = ["movement_reactions"]
+temperament = ["mentality_composure"]
+stamina = ["power_stamina"]
+strength = ["power_strength"]
+fitness = 95
+
+# Goalkeepers reuse the outfield slots (lma-data RATINGS): reach=tackling, awareness=marking,
+# distribution=passing, handling=technique, reflexes=shot_accuracy, aerial=heading, agility=pace.
+[gk_ratings]
+tackling = ["goalkeeping_diving"]
+marking = ["goalkeeping_positioning"]
+passing = ["goalkeeping_kicking"]
+technique = ["goalkeeping_handling"]
+dribbling = ["skill_dribbling"]
+shot_power = ["power_shot_power"]
+shot_accuracy = ["goalkeeping_reflexes"]
+heading = ["goalkeeping_handling", "power_jumping"]
+positioning = ["goalkeeping_positioning"]
+runs = ["mentality_positioning"]
+creativity = ["mentality_vision"]
+pace = ["goalkeeping_diving", "movement_agility"]
+intelligence = ["movement_reactions"]
+temperament = ["mentality_composure"]
+stamina = ["power_stamina"]
+strength = ["power_strength"]
+fitness = 95
+
+[scale]
+mul = 1.0
+add = 0.0
+# the spread (the maintainer, 21 Oct): the level the game sees is the source's overall through this curve
+# (with overall_from_source): the top stretched (85 -> 86, 90 -> 93, 95 -> 99), the bottom lowered
+# (60 -> 52, 55 -> 45), 75-80 as they are, so a 91 stands clear of an 80 and League Two of League One
+curve = [[50, 38], [55, 45], [60, 52], [65, 59], [70, 66], [75, 73], [80, 80], [85, 86], [90, 93], [95, 99]]
+
+[positions]
+GK = "GK"
+CB = "DEF"
+LB = "DEF"
+RB = "DEF"
+LWB = "DEF"
+RWB = "DEF"
+CDM = "MID"
+CM = "MID"
+CAM = "MID"
+# wide players as vanilla files Robben, Giggs and Cristiano Ronaldo: midfielders who also play up
+# front, wide midfielders and wingers alike (the maintainer's play-test: RM/RW usable in both lines)
+LM = "MID/ATT"
+RM = "MID/ATT"
+LW = "MID/ATT"
+RW = "MID/ATT"
+CF = "ATT"
+ST = "ATT"
+
+# The sides each position is played on (L, R, C): a player's are those of his position and
+# alternates (Mbappé ST + LW -> both flanks and centre). Goalkeepers LRC, as in vanilla; central
+# midfielders too, so they can fill LM/RM (the maintainer's play-test); wide midfielders and wingers play
+# either flank (the maintainer, 12 Oct: "all wingers, LM/RM can play strong on whatever wing they're on").
+[sides]
+GK = "LRC"
+CB = "C"
+LB = "L"
+RB = "R"
+LWB = "L"
+RWB = "R"
+CDM = "C"
+CM = "LRC"
+CAM = "C"
+LM = "LR"
+RM = "LR"
+LW = "LR"
+RW = "LR"
+CF = "C"
+ST = "C"
+
+# Grounds replaced (or renamed for good) since 2006 that Transfermarkt's clubs file doesn't cover:
+# "club|stadium" as the database has them -> today's name (factual names; sponsor-only renames like
+# Bolton's are left).
+[stadium_renames]
+"Colchester United|Layer Road" = "Colchester Community Stadium"
+"Doncaster Rovers|Belle Vue" = "Eco-Power Stadium"
+"Chesterfield|Saltergate" = "SMH Group Stadium"
+"Rotherham United|Millmoor" = "New York Stadium"
+"Coventry City|Ricoh Arena" = "Coventry Building Society Arena"
+"Shrewsbury Town|Gay Meadow" = "New Meadow"
+"Milton Keynes Dons|National Hockey Stadium" = "Stadium MK"
+"York City|KitKat Crescent" = "LNER Community Stadium"
+"Barnet|Underhill Stadium" = "The Hive"
+"Boston United|York Street" = "Jakemans Community Stadium"
+"Leyton Orient|The Matchroom Stadium" = "Brisbane Road"
+"Darlington|TFM Darlington Arena" = "Blackwell Meadows"
+"Forest Green Rovers|The Lawn" = "The New Lawn"
+
+# Words expanded before club names are compared (lower case).
+[abbreviations]
+utd = "united"
+man = "manchester"
+ath = "athletic"
+wed = "wednesday"
+nott = "nottingham"
+st = "saint"
+
+# FC club name -> LMA club name, where normalisation isn't enough (edit to match your database).
+[club_aliases]
+"Spurs" = "Tottenham Hotspur"
+"Nott'm Forest" = "Nottingham Forest"
+"Newcastle Utd" = "Newcastle United"
+"Inverness Caledonian Thistle FC" = "Inverness CT"   # the live squads' name (#699)
+# 2006's A-League and South American records under their old or shared names ("#id": LMA has
+# two Newcastle Uniteds and two Américas)
+"Newcastle Jets" = "#880"
+"Brisbane Roar" = "Queensland Roar FC"
+"Uni. Católica" = "Universidad Católica"
+"América de Cali" = "#1056"
+"Ipswich" = "Ipswich Town"
+"West Ham" = "West Ham United"
+"Bolton" = "Bolton Wanderers"
+"Norwich" = "Norwich City"
+"Charlton Ath" = "Charlton Athletic"
+"Preston" = "Preston North End"
+"West Brom" = "West Bromwich Albion"
+"QPR" = "Queens Park Rangers"
+"Wycombe" = "Wycombe Wanderers"
+"MK Dons" = "Milton Keynes Dons"
+"Stockport" = "Stockport County"
+"Stevenage" = "Stevenage Borough"
+"Huddersfield" = "Huddersfield Town"
+"Doncaster" = "Doncaster Rovers"
+"Peterborough" = "Peterborough United"
+"Northampton" = "Northampton Town"
+"Colchester" = "Colchester United"
+"Accrington" = "Accrington Stanley"
+"Shrewsbury" = "Shrewsbury Town"
+"Paris SG" = "Paris St Germain"
+"OL" = "Lyon"
+"OM" = "Marseille"
+"Latium" = "Lazio"
+"Bergamo Calcio" = "Atalanta"
+"Milano FC" = "AC Milan"
+"Lombardia FC" = "Inter Milan"
+"Atlético de Madrid" = "A Madrid"
+"Athletic Club" = "Bilbao"
+"Dynamo Kyiv" = "Dynamo Kiev"
+# LMA's English names are mostly the city (#31: these clubs kept their 2006 squads)
+"RC Deportivo" = "La Coruña"
+"Sevilla FC" = "Seville"
+"Celta" = "Vigo"
+"Real Sociedad" = "San Sebastian"
+"RCD Espanyol" = "Español"
+"CA Osasuna" = "Pamplona"
+"D. Alavés" = "Vitoria"
+"Rayo Vallecano" = "Madrid RV"
+"UD Las Palmas" = "Las Palmas"
+"Hamburger SV" = "Hamburg"
+"Hertha BSC" = "Berlin"
+"M'gladbach" = "Mönchengladbach"
+"1. FC Köln" = "Cologne"
+"1. FC Nürnberg" = "Nuremberg"
+"Karlsruher SC" = "Karlsruhe"
+"SV Waldhof" = "Mannheim"
+"PSV" = "PSV Eindhoven"
+"AZ" = "AZ Alkmaar"
+"N.E.C. Nijmegen" = "NEC"
+"SC Telstar" = "Stormvogels/Telstar"
+"Stade Rennais FC" = "Rennes"
+"LOSC Lille" = "Lille OSC"
+"AS Saint-Étienne" = "Saint-Etienne"
+"FC Lorient" = "Lorient Bretagne"
+"Le Mans FC" = "Le Mans UC 72"
+"Havre AC" = "Le Havre"
+"Stade Brestois 29" = "Brest"
+"Clermont Foot 63" = "Clermont Foot"
+"US Boulogne" = "Boulogne-sur-Mer"
+"Laval MFC" = "Stade Lavallois"
+"Olympiacos FC" = "Olympiakos"
+"SC Braga" = "Sporting Braga"
+"Dinamo Zagreb" = "NK Dinamo Zagreb"
+"Hajduk Split" = "HNK Hajduk Split"
+"RB Salzburg" = "SV Salzburg"
+"FK Austria Wien" = "Austria Vienna"
+"SK Rapid" = "Rapid Vienna"
+"SV Oberbank Ried" = "SV Ried"
+"Sparta Praha" = "Sparta Prague"
+"Slavia Praha" = "Slavia Prague"
+"Viktoria Plzeň" = "Viktoria Plzen"
+"F.C. København" = "FC Copenhagen"
+"Odense BK" = "OB Odense"
+"IFK Göteborg" = "IFK Gothenburg"
+"BSC Young Boys" = "Young Boys Bern"
+"FC Luzern" = "FC Lucerne"
+"STVV" = "St Truiden"
+"Legia Warszawa" = "Legia Warsaw"
+"Zagłębie Lubin" = "Zaglebie Lubin"
+"Cracovia" = "MKS Cracovia"
+"FCSB" = "Steaua Bucharest"
+"FC Rapid 1923" = "Rapid Bucharest"
+"FC Dinamo 1948" = "Dinamo Bucharest"
+"CFR 1907 Cluj" = "CFR Cluj"
+"APOEL FC" = "APOEL Nicosia"
+"Omonia FC" = "Omonia Nicosia"
+"St. Pats" = "St Patrick's"
+"Waterford" = "Waterford United"
+"Newell's" = "Newell's Old Boys"
+"Argentinos Jrs." = "Argentinos Juniors"
+"Gimnasia" = "Gimnasia LP"
+"Estudiantes" = "Estudiantes LP"
+"Indep. Santa Fe" = "Independ. Santa Fe"
+"Indep. Medellín" = "Independ. Medellín"
+"Junior" = "Atlético Junior"
+"LA Galaxy" = "Los Angeles Galaxy"
+"Red Bulls" = "New York Red Bulls"
+"New England" = "New England Rev."
+"Sporting KC" = "Kansas Cty Wizards"
+"Ulsan HD FC" = "Ulsan Hyundai"
+"Jeonbuk Hyundai" = "Chonbuk Hyundai"
+"Daejeon Hana" = "Daejeon Citizen"
+"Gimcheon Sangmu" = "Gwangju Sangmu"
+"Melb. Victory" = "Melbourne Victory"
+"Central Coast" = "C. Coast Mariners"
+"Union Berlin" = "Union"
+"R. Racing Club" = "Santander"
+"Vitória SC" = "Vitória Guimarães"
+"Atl. Nacional" = "Atlético Nacional"
+"VfB Stuttgart II" = "Stuttgart Amateure"
+"R. Sporting" = "Gijón"
+"Farul Constanța" = "Farul Constanta"
+"FC Argeș" = "Arges Pitesti"
+"SC Oțelul Galați" = "Otelul Galati"
+"Zulte Waregem" = "SV Zulte-Waregem"
+"SC Cambuur" = "Cambuur Leeuwarden"
+# "" = not in LMA's database, so no word match lands it on a namesake (LMA's Union is Union
+# Berlin; Western Sydney was founded in 2012)
+"R. Union St.-G." = ""
+"WS Wanderers" = ""
+
+# FC nationality -> LMA nation name.
+[nation_aliases]
+"Korea Republic" = "South Korea"
+"Côte d'Ivoire" = "Ivory Coast"
+"Türkiye" = "Turkey"
+"Czechia" = "Czech Republic"
+"Republic of Ireland" = "Ireland"
+"Cabo Verde" = "Cape Verde"
+
+# Attribute source merged over the FC roster (`lma-cli squad-import ... --fm <csv>`):
+# an FM26 export from `fmsave export <save>.fm players --all`. A player found there by birth
+# date + a shared surname word takes these ratings and FM's height. raw_attributes_* are FM's
+# internal 1-100 values (the 1-20 attributes are raw / 5), the same scale as LMA's ratings.
+[fm]
+first_name = "first_name"
+last_name = "last_name"
+common_name = "common_name"
+birth_date = "birth_date"
+height_cm = "height_cm"
+# FM26's weekly wage (GBP): the players' real wages to the mod's wages.csv (the maintainer, 11 Oct)
+wage = "contract_wage"
+# FM26's transfer value (GBP): a player's value when Transfermarkt has none for him (TM > FC27 > FM26)
+value = "transfer_value"
+contract_end = "contract_end"
+
+[fm.ratings]
+tackling = ["raw_attributes_tackling"]
+marking = ["raw_attributes_marking"]
+passing = ["raw_attributes_passing"]
+technique = ["raw_attributes_technique", "raw_attributes_first_touch"]
+dribbling = ["raw_attributes_dribbling"]
+shot_power = ["raw_attributes_long_shots", "raw_attributes_strength"]
+shot_accuracy = ["raw_attributes_finishing"]
+heading = ["raw_attributes_heading", "raw_attributes_jumping_reach"]
+positioning = ["raw_attributes_positioning"]
+runs = ["raw_attributes_off_the_ball"]
+creativity = ["raw_attributes_vision", "raw_attributes_flair"]
+pace = ["raw_attributes_pace", "raw_attributes_acceleration"]
+intelligence = ["raw_attributes_decisions", "raw_attributes_anticipation"]
+temperament = ["raw_attributes_composure"]
+stamina = ["raw_attributes_stamina"]
+strength = ["raw_attributes_strength"]
+fitness = ["raw_attributes_natural_fitness"]
+
+# Goalkeepers (LMA slots: reach=tackling, awareness=marking, distribution=passing,
+# handling=technique, reflexes=shot_accuracy, aerial=heading, agility=pace)
+[fm.gk_ratings]
+tackling = ["raw_attributes_one_on_ones", "raw_attributes_rushing_out"]
+marking = ["raw_attributes_command_of_area", "raw_attributes_positioning"]
+passing = ["raw_attributes_kicking", "raw_attributes_throwing"]
+technique = ["raw_attributes_handling"]
+dribbling = ["raw_attributes_first_touch"]
+shot_power = ["raw_attributes_kicking"]
+shot_accuracy = ["raw_attributes_reflexes"]
+heading = ["raw_attributes_aerial_reach"]
+positioning = ["raw_attributes_positioning"]
+runs = ["raw_attributes_off_the_ball"]
+creativity = ["raw_attributes_vision"]
+pace = ["raw_attributes_agility"]
+intelligence = ["raw_attributes_decisions", "raw_attributes_anticipation"]
+temperament = ["raw_attributes_composure"]
+stamina = ["raw_attributes_stamina"]
+strength = ["raw_attributes_strength"]
+fitness = ["raw_attributes_natural_fitness"]
+
+[fm.scale]
+mul = 1.0
+add = 0.0
+
+# Skin tone (#31 item 5): `tools/fm_skin.py` adds FM's per-player `skin_tone` (1 lightest .. 20
+# darkest) to the export; without the column, players take their nation's vanilla default.
+# lma[tone - 1]: 0 light (1-7), 1 olive (8-10), 3 (11-15), 2 (16-20); vanilla's 3s (Henry,
+# Ferdinand) sit around FM 12-14 among the 362 players in both databases, its 2s (Drogba,
+# Essien) higher.
+[fm.skin]
+column = "skin_tone"
+lma = [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2]
+
+# FM's hair (#697, from the save beside the skin tone: tools/fm_skin.py): FM's colour value -> the
+# record's hair colour (lma-data HAIR_COLOUR, bits 266-269, 0-13: 0 black, 1 dark brown, 2 brown,
+# 3 dark blonde, 4 light brown, 5 ginger, 10 blonde, from vanilla's well-known players). FM's values
+# are not a light-to-dark scale: this map is the majority of the 360 players in both FM26 and the
+# 2006 database (same name, consistent age), with today's players as checks (7: Haaland, Hojlund,
+# De Bruyne, McTominay; 15: Salah, Mbappe, Foden). The importer makes a dark-skinned player's dark
+# brown or brown black. The hair *type* (bits 270-274, 0-31) isn't mapped until its ids are pinned
+# to Hair.mng's styles: with no style rows every imported player draws one from vanilla's own mix.
+[fm.hair]
+colour = "hair_colour"
+kind = "hair_type"
+length = "hair_length"
+colour_lma = [[1, 1, 3], [2, 3, 1], [4, 4, 5], [5, 6, 1], [7, 7, 3], [8, 8, 4], [9, 9, 1], [10, 10, 3], [11, 12, 1], [13, 13, 5], [14, 14, 3], [15, 15, 1], [16, 18, 0]]
+style_lma = []
+
+# The FM export as a roster too (#31, the maintainer 10 Oct: "world is 2026 only"): its players fill the
+# LMA clubs FC 27 doesn't cover (never one FC 27 has), and its unattached players every record
+# no squad uses, so no 2006 player is left in a squad or the free agents.
+[fm.fill]
+club = "club_name"
+nation = "nation_id"
+positions = "natural_positions"
+alt_positions = "accomplished_positions"
+ability = "ability_current"
+left_foot = "left_foot"
+right_foot = "right_foot"
+# FM 26 has women's football too, with no gender field: its women's sections (median height
+# 160-174 cm, men's clubs 176-188) are left out, and free agents come from the older database
+# (uids below 2,000,000,000: 5,239 unattached men; the women's database is all newer)
+club_uid = "club_uid"
+club_short = "club_short_name"
+min_club_height_cm = 174.0
+uid = "uid"
+free_agent_uid_below = 2000000000
+
+# Managers (#31 decision 2, `--staff <fmsave export SAVE staff --all>`): each club takes its FM
+# club's manager: role 16 (fmsave 0.5's unknown_r4) and not on the club's staff lists (coaches,
+# physios and scouts are); a B or youth side's manager on the same club loses to the more able.
+[fm.managers]
+club_uid = "club_uid"
+role = "unknown_r4"
+# the manager (16), else a caretaker (2: Southampton's Eckert, West Brom's Morrison)
+manager_roles = ["16", "2"]
+listed = "in_club_lists"
+ability = "ability_current"
+surname = "last_name"
+common_name = "common_name"
+# reputations (the stars) from FM ability: 40 -> 1, 190 -> 99 (Guardiola 99, Slot 83, Arteta 79,
+# Carrick 58; the maintainer, 12 Oct: "Carrick is 4.5 stars" in Ferguson's 2006 record)
+reputation = [40.0, 190.0]
+
+# FM position labels -> FC 27's
+[fm.fill.labels]
+GK = "GK"
+SW = "CB"
+DC = "CB"
+DL = "LB"
+DR = "RB"
+WBL = "LWB"
+WBR = "RWB"
+DM = "CDM"
+MC = "CM"
+ML = "LM"
+MR = "RM"
+AMC = "CAM"
+AML = "LW"
+AMR = "RW"
+STC = "ST"
+
+# Transfermarkt players export (`squad-import ... --tm <players.csv>`, e.g. dcaribou's CC0
+# transfermarkt-datasets): market value sets each matched player's overall level and stored value,
+# the sub-position his line (#31). Column names only, no data. `value_scale` (stored GBP 1000s per
+# EUR 1000) defaults to 0.85 / 4: the exchange rate, over 4 for 2006 fee levels.
+# today's competition names (the maintainer, 12 Oct), by LMA_?.lng index, in every language; "id:E" for
+# English only. The game's sentences that name them ("Qualify for the European Cup") are its own
+# text: rewrite those in the local mod, never here. 372 is England's and Scotland's top flight alike:
+# "Premier League" for England (Scotland's shows it too). Left as they are: 373-375, 378/379,
+# 381/382 (which country each is still to check),
+# 386 League Cup (Scotland's too), 392 Coupe de la Ligue and 395 Liga-Pokal (abolished; their slots
+# may carry other cups, #607)
+[strings]
+"372" = "Premier League"
+"383" = "National League"
+"387" = "Community Shield"
+"394" = "DFB-Pokal"
+"396" = "Champions League"
+"397" = "Europa League"
+"1517" = "UEFA Super Cup"
+"3352" = "EFL Trophy (N)"
+"3353" = "EFL Trophy (S)"
+"3354" = "EFL Trophy"
+"3355" = "EFL Trophy"
+"3387" = "Eerste Divisie"
+"3388" = "Liga Portugal"
+"3389" = "Liga Portugal 2"
+"3468" = "EFL Trophy"
+
+# three-letter short names for every club (the match scorebug showed 2006's "Ars'nl", "Ch'sea"); a
+# club not named here gets the first three letters of its name's first word that isn't a prefix
+[club_codes]
+"Aston Villa" = "AVL"
+"Manchester City" = "MCI"
+"Manchester United" = "MUN"
+"Newcastle United" = "NEW"
+"Nottingham Forest" = "NFO"
+"Brighton" = "BHA"
+"West Ham United" = "WHU"
+"Wolverhampton Wanderers" = "WOL"
+"West Bromwich Albion" = "WBA"
+"Sheffield United" = "SHU"
+"Sheffield Wednesday" = "SHW"
+"Queens Park Rangers" = "QPR"
+"Blackburn Rovers" = "BLB"
+"Bristol City" = "BRC"
+"Bristol Rovers" = "BRR"
+"Dundee United" = "DDU"
+"Dundee" = "DUN"
+"St Johnstone" = "STJ"
+"St Mirren" = "STM"
+"Madrid" = "RMA"
+"A Madrid" = "ATM"
+"Bilbao" = "ATH"
+"Vigo" = "CEL"
+"Real Sociedad" = "RSO"
+"Santander" = "RAC"
+"Deportivo Alavés" = "ALA"
+"Bayern" = "FCB"
+"Dortmund" = "BVB"
+"Leverkusen" = "B04"
+"Leipzig" = "RBL"
+"Union" = "FCU"
+"Frankfurt" = "SGE"
+"Hamburg" = "HSV"
+"Stuttgart" = "VFB"
+"Schalke" = "S04"
+"Bremen" = "SVW"
+"Hoffenheim" = "TSG"
+"Freiburg" = "SCF"
+"Mainz" = "M05"
+"Augsburg" = "FCA"
+"Paris St Germain" = "PSG"
+"Paris FC" = "PFC"
+"AS Nancy-Lorraine" = "NCY"
+"OGC Nice" = "NIC"
+"Stade Rennais FC" = "REN"
+"Le Mans UC 72" = "LMS"
+"Le Havre" = "HAC"
+"AZ Alkmaar" = "AZ"
+"Go Ahead Eagles" = "GAE"
+"Estrela Amadora" = "EAM"
+"Sporting CP" = "SCP"
+"Sporting Braga" = "BRA"
+"Benfica" = "SLB"
+"FC Porto" = "FCP"
+
+[transfermarkt]
+last_name = "last_name"
+name = "name"
+birth_date = "date_of_birth"
+value = "market_value_in_eur"
+# contract end dates: the years left in wages.csv (the maintainer, 11 Oct: real contracts)
+contract_end = "contract_expiration_date"
+sub_position = "sub_position"
+height_cm = "height_in_cm"
+# the level: Transfermarkt value and FC 27's overall, half each (value alone sank Rodri: EUR 50m
+# after his knee, FC 27 rates him 90)
+overall_weight = 0.5
+# real-life values (the maintainer, 10 Oct: "real life", with club funds x4 by the mod's [[patch]] words):
+# EUR -> GBP only, no 2006 discount; the field holds GBP 65.5m at most, so the top 43 sit there
+value_scale = 0.85
+# club funds (the maintainer, 10-11 Oct): each club's wealth tier is the nearest of these (GBP m, the bank
+# balance it starts with) to its transfer budget (--budgets, FC 27's career mode) / transfer_share,
+# else to budget_share of its live Transfermarkt squad value. The game makes funds tier word x 10 x
+# its country's multiplier (40-175, England 150) and caps them at 999,999,999; the mod's [[patch]]
+# words set every multiplier to 100 and tier k's word to wealth_budgets[k] x 1000.
+wealth_budgets = [0.61, 1.65, 2.83, 4.36, 6.29, 9.12, 14.75, 19.55, 29.67, 43.34, 63.76, 91.24, 118.35, 175.27, 298.74, 394.28]
+# the tier is also a club's stature for the AI: tiers by rank keep each country's 2006 spread (#704)
+wealth_by_rank = true
+budget_share = 0.15
+# unmatched players get the median Transfermarkt value of matched peers (same group and overall)
+fill_values = true
+# with --weights (the game's overall weights): the overall the game shows is FC 27's (the maintainer, 11 Oct)
+overall_from_source = true
+# the online FC 27 lists as they are (the maintainer, 11 Oct, from the game: Arsenal and Spurs GBP 200m,
+# Liverpool 250m, Brighton 75m)
+budgets_scale = 1.0
+# the board lends all of a club's funds for transfers, not 65%: the mod patches the share (a float
+# Club_TransferBudgetGet reads; the Mac, 11 Oct; the maintainer: offers capped at 80m of 198m), so funds are
+# the budgets themselves, no / 0.65
+transfer_share = 1.0
+# the game's own per-club funds multipliers (0x820eaa10), offset when picking the tier
+funds_factors = { "Chelsea" = 2.0, "Celtic" = 0.8, "Rangers" = 0.8 }
+# each club's Transfermarkt club (most of its matched players') gives its 2026 stadium: name and
+# seats from the clubs file (--tm-clubs, dcaribou's clubs.csv; its 32 top flights)
+club = "current_club_id"
+# membership and managers from Transfermarkt over FC 27 / FM: off, its data ends with 2025/26
+# (the maintainer's call pending, 10 Oct); its managers fill only clubs FM26 has none for
+membership = false
+managers_over_fm = false
+# shirt numbers: each player's latest in Transfermarkt's game lineups (--tm-lineups) at his club
+id = "player_id"
+
+[transfermarkt.stadiums]
+id = "club_id"
+name = "stadium_name"
+seats = "stadium_seats"
+# a club its players don't vote for (Hull: no tracked club) by its name, when only one club has it
+club = "name"
+
+[transfermarkt.lineups]
+player = "player_id"
+club = "club_id"
+number = "number"
+date = "date"
+
+# league histories: each season's champion from Transfermarkt's games (--tm-games), on top of the
+# LMA league's champions list ([country, tier]; Transfermarkt's games start with 2012/13)
+[transfermarkt.history]
+competition = "competition_id"
+season = "season"
+date = "date"
+home_club = "home_club_id"
+away_club = "away_club_id"
+home_goals = "home_club_goals"
+away_goals = "away_club_goals"
+home_club_name = "home_club_name"
+away_club_name = "away_club_name"
+home_manager = "home_club_manager_name"
+away_manager = "away_club_manager_name"
+# cup finals: the game in round "Final" of each cup below
+round = "round"
+game_id = "game_id"
+# tied points are split by the head-to-head record in these (last_tables.csv's final tables)
+h2h = ["ES1", "IT1", "PO1"]
+
+[transfermarkt.history.leagues]
+GB1 = [0, 0]
+SC1 = [1, 0]
+IT1 = [2, 0]
+ES1 = [3, 0]
+L1 = [4, 0]
+FR1 = [5, 0]
+NL1 = [6, 0]
+PO1 = [7, 0]
+
+# the game's cup histories (lma_data::db::CUPS) these competitions fill; the League Trophy has none
+[transfermarkt.history.cups]
+CL = "european_cup"
+EL = "uefa_cup"
+USC = "super_cup"
+FAC = "fa_cup"
+CGB = "league_cup"
+GBCS = "charity_shield"
+
+[transfermarkt.positions]
+"Goalkeeper" = "GK"
+"Centre-Back" = "DEF"
+"Left-Back" = "DEF"
+"Right-Back" = "DEF"
+"Defensive Midfield" = "MID"
+"Central Midfield" = "MID"
+"Left Midfield" = "MID/ATT"
+"Right Midfield" = "MID/ATT"
+"Attacking Midfield" = "MID"
+"Left Winger" = "MID/ATT"
+"Right Winger" = "MID/ATT"
+"Second Striker" = "ATT"
+"Centre-Forward" = "ATT"
+
+# League ladders (#31 item 7). The game's leagues are club-id ranges (the Mac's proof, Agent sync
+# 6096955231: England 0-19 Premiership, 20-43, 44-67, 68-91, 92-115), so the import moves each
+# club it re-seats to an id in its new division (clubs.csv record_of, with that division's
+# country and division bytes) and writes its squad there; fixtures are untouched.
+# Each ladder: a country's divisions top to bottom as clubs.csv numbers them
+# (lma-data's `country` / `division`), and the FC 27 league that fills each ("" = none in FC 27).
+# Clubs FC 27 places in a ladder's league take places there; each division keeps its size, so
+# clubs pushed below the bottom go to `overflow` (default [15, 12], the non-league pool).
+# `comps`: the live Transfermarkt competition (`--tm-live`, tools/tm_live.py) that fills each
+# division, over FC 27's league for a club both name (#699: live membership first); "" = none.
+# A division bigger than the real league (Ligue 1 and 2 are 20 for 18, Serie B 22 for 20) keeps
+# its spare places for clubs the sources have in no league; one smaller (Primeira Liga 16 for 18)
+# drops the real league's last clubs to the division below.
+[[ladders]]
+country = 0
+divisions = [0, 19, 20, 21, 11]
+leagues = ["Premier League", "EFL Championship", "EFL League One", "EFL League Two", "National League"]
+# the National League from the live squads too (CNAT): fc27final30 kept 2006's Conference
+# (Rushden & Diamonds, Chester City, Grays, Northwich) instead of Woking, Wealdstone, Gateshead
+comps = ["GB1", "GB2", "GB3", "GB4", "CNAT"]
+
+[[ladders]]
+country = 1
+divisions = [0, 1, 2, 3]
+leagues = ["Scottish Premiership", "", "", ""]
+comps = ["SC1", "SC2", "", ""]
+
+[[ladders]]
+country = 2
+divisions = [4, 5]
+leagues = ["Serie A Enilive", "Serie BKT"]
+comps = ["IT1", "IT2"]
+
+[[ladders]]
+country = 3
+divisions = [6, 7]
+leagues = ["LALIGA EA SPORTS", "LALIGA HYPERMOTION"]
+comps = ["ES1", "ES2"]
+
+# 17 and 18 are the two 2005/06 Regionalliga groups; FC 27's 3. Liga has no LMA division
+[[ladders]]
+country = 4
+divisions = [9, 10, 17, 18]
+leagues = ["Bundesliga", "Bundesliga 2", "", ""]
+comps = ["L1", "L2", "", ""]
+
+[[ladders]]
+country = 5
+divisions = [1, 2, 8]
+leagues = ["Ligue 1 McDonald's", "Ligue 2 BKT", ""]
+comps = ["FR1", "FR2", ""]
+
+[[ladders]]
+country = 6
+divisions = [13, 14]
+leagues = ["Eredivisie", ""]
+comps = ["NL1", "NL2"]
+
+[[ladders]]
+country = 7
+divisions = [15, 16]
+leagues = ["Liga Portugal", ""]
+comps = ["PO1", "PO2"]
