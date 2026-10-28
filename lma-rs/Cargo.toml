@@ -5,6 +5,7 @@ members = ["crates/lma-data", "crates/lma-cli", "crates/xex", "crates/ppc", "cra
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
 
 # Quick iteration on the recompiler or the guest crate: like release, but the 32 generated
 # game-block parts (by far the slowest to compile) unoptimised. M4 Max: a guest change rebuilds

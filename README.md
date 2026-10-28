@@ -68,3 +68,10 @@ Not affiliated with or endorsed by Codemasters. LMA Manager is a trademark of it
 Developed with a team of AI coding agents (Claude Code) across Mac and Windows machines,
 coordinated through GitHub issues and pull requests. The maintainer sets the architecture,
 priorities and milestones, and reviews and merges every change.
+
+## License
+
+The code in this repository is dual-licensed under [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option. The licence covers this project's own code only:
+LMA Manager 2007 itself, its code and its assets remain the property of their owners (see
+[LEGAL.md](LEGAL.md)).

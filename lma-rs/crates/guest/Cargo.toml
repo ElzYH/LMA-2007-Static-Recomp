@@ -2,6 +2,7 @@
 name = "guest"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 description = "Guest CPU state, interpreter, memory and the helpers recompiled code calls: the stable interface the generated game-blocks parts depend on, so most runtime changes don't rebuild them."
 
 [dependencies]

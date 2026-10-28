@@ -1,6 +1,7 @@
 [package]
 name = "lma-import"
 edition.workspace = true
+license.workspace = true
 version.workspace = true
 description = "Imports real-world squads (EA FC rosters, FM attributes) into an LMA mod space (#20)"
 
