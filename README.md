@@ -15,30 +15,41 @@ macOS (Apple Silicon and Intel) and Linux, from your own copy of the game.
 - Modding: the game's database (players, clubs, squads, names, badges) and 50+ of its rules (wages,
   transfers, prize money, player development, substitutions) can be changed by name. See
   [MODS.md](MODS.md).
-- Not yet: recompiling from your disc at first run. Today you build it yourself from your own
-  `default.xex` (below), so no binary releases are published here yet.
+- Releases are source only: one command builds the game from your own disc (below). A download
+  that recompiles from your disc at first run is planned.
 
 See [lma-rs/PORT_PLAN.md](lma-rs/PORT_PLAN.md) for the architecture and
 [docs/NATIVE_GAME.md](docs/NATIVE_GAME.md) for the plan towards fully readable code.
 
 ## Building
 
-You need Rust (stable), your own legally obtained LMA Manager 2007 disc, and its files extracted
-(`python tools/xiso.py <your.iso> extract <dir>`).
+You need your own legally obtained LMA Manager 2007 (Xbox 360) disc image, [Rust](https://rustup.rs)
+and Python 3. Then, from this folder:
 
 ```
+python3 tools/build_from_disc.py <your LMA Manager 2007 .iso>
+```
+
+It extracts the disc, recompiles the game's code from its `default.xex`, builds the app and points
+it at the game files, all on your machine. The first build takes about 10-30 minutes. Then start
+`lma-rs/target/release/lma-app` (`lma-app.exe` on Windows). An already extracted copy works too:
+pass its folder instead of the `.iso`.
+
+By hand, the same steps are:
+
+```
+python3 tools/xiso.py <your.iso> extract <dir>
 cd lma-rs
 cargo build --release -p recomp
 target/release/lma-recomp <dir>/default.xex all crates/game-blocks 999999 32
 cargo build --release -p lma-cli -p lma-app
-target/release/lma-app
 ```
 
 The app finds the game files through `game_dir` in its `config.toml` (`~/Library/Application
 Support/lma-rs/` on macOS, `%APPDATA%\lma-rs\` on Windows, `~/.config/lma-rs/` elsewhere).
 
-The recompiled code (`crates/game-blocks/parts/`) is generated from your copy of the game and must
-never be shared or committed.
+The recompiled code (`crates/game-blocks/parts/`) and the extracted files are generated from your
+copy of the game: never share or commit them.
 
 ## Layout
 
