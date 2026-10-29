@@ -54,6 +54,8 @@ def main():
     if len(a) < 5:
         sys.exit(__doc__)
     sides = [(a[0], a[1]), (a[2], a[3])]
+    if a[0] == a[2]:
+        sys.exit(f'both sides are named {a[0]}: their timings would land in one list')
     states = [os.path.expanduser(s) for s in a[4:]]
     xex, rounds, length = os.path.expanduser(opts['xex']), int(opts['rounds']), int(opts['run'])
     cwd = tempfile.mkdtemp(prefix='lma-seg-')

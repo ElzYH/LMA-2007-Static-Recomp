@@ -9,6 +9,8 @@
 //!                   calendar_weeks = 1            (optional, with calendar_weekdays: every round a week later,
 //!                                                  2026/27's real opening days, PL Sat 22 Aug, EFL Sat 15 Aug; a
 //!                                                  season whose late-June rounds can't move keeps its weekdays only)
+//!                   league_phase = true           (optional: the European Cup in the 2024+ shape, 36 clubs in one
+//!                                                 league of 8 matchdays, a play-off, then the last 16; #703)
 //!                   value_unit = 5000             (optional: GBP per unit of a player's stored value, vanilla 1000)
 //!                   income_scale = 4.0            (optional: factor on gate receipts, sponsorship, prize money)
 //!                   gate_scale = 8.0              (optional: the gate receipts' own factor instead)
@@ -16,6 +18,7 @@
 //!                   wage_budget_cap = 10000000    (optional: the clubs' weekly wage budget cap, vanilla GBP 3.2m)
 //!                   wage_cap = 2000000            (optional: the most a contract offer may pay a week, vanilla GBP 250,000)
 //!                   ai_signing_wage_cap = 1000000 (optional: the most an AI club's signing may pay a week, vanilla GBP 100,000)
+//!                   [tune] prime_wage_premium = 15  (optional: the game's numbers by name, guest::tune::TUNABLES, #870)
 //!                   sponsor_offer_scale = [24.0, 6.0, 3.0]  (optional: shirt sponsorship offers x this by division, top first)
 //!                   sponsor_offer_country = [1.0, 0.15, 0.6, 0.8, 0.8, 0.6, 0.2, 0.2]  (optional, with the above: x this
 //!                                                 per country: England, Scotland, Italy, Spain, Germany, France,
@@ -23,6 +26,7 @@
 //!                   subs = 5                      (optional: substitutions in a competitive match, 3-5, vanilla 3)
 //!                   bench = 9                     (optional: substitutes a match can bring on, 5-9, vanilla 5; the
 //!                                                 ones after the 5 are the first reserves after the matchday 16)
+//!                   rating_wage_scale = 5.0       (optional: factor on the wage the game works out from a player's rating: regens, youth, demands)
 //!                   ai_wage_offers = true         (optional: AI clubs offer at least the player's wage + 10%, wages above GBP 250k a week possible)
 //!                   formations = "formations.csv" (optional: formation rows added or changed, see below)
 //!                   board_share = 1.0             (optional: the share of a club's funds the board releases for transfers, vanilla 0.65)
@@ -72,6 +76,15 @@ fn retime_diary(export: &[u8], year: i32, weeks: u32) -> Result<Vec<u8>, String>
     Ok(ar.build())
 }
 
+/// `Export.mng` with every season's European Cup in the league-phase shape (`lma_data::diary::league_phase_archive`).
+fn league_phase_diary(export: &[u8]) -> Result<Vec<u8>, String> {
+    let mut ar = lma_data::Archive::parse(export).map_err(|e| e.to_string())?;
+    let diary = ar.get("Diary20.mng").ok_or("Export.mng has no Diary20.mng")?;
+    let shaped = lma_data::diary::league_phase_archive(diary).map_err(|e| e.to_string())?;
+    ar.set("Diary20.mng", shaped);
+    Ok(ar.build())
+}
+
 fn lang_path(l: char) -> String {
     format!("d:\\Common\\GameData\\Misc\\Lang\\LMA_{l}.lng")
 }
@@ -101,11 +114,13 @@ struct Manifest {
     base_year: Option<u32>,
     calendar_weekdays: Option<bool>,
     calendar_weeks: Option<u32>,
+    league_phase: Option<bool>,
     value_unit: Option<u32>,
     income_scale: Option<f64>,
     gate_scale: Option<f64>,
     wage_cap: Option<u32>,
     ai_signing_wage_cap: Option<u32>,
+    rating_wage_scale: Option<f64>,
     sponsor_offer_scale: Option<Vec<f64>>,
     sponsor_offer_country: Option<Vec<f64>>,
     board_share: Option<f64>,
@@ -121,6 +136,18 @@ struct Manifest {
     formations: Option<String>,
     #[serde(default)]
     patch: Vec<Patch>,
+    /// `[tune]`: the game's numbers by name (`guest::tune::TUNABLES`, #870)
+    #[serde(default)]
+    tune: std::collections::BTreeMap<String, TuneValue>,
+}
+
+/// A `[tune]` value: a number, or an array for a table.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum TuneValue {
+    One(i64),
+    Real(f64),
+    Many(Vec<i64>),
 }
 
 /// One 32-bit word of the loaded image, replaced when the mod starts (`from` must match).
@@ -157,6 +184,9 @@ pub struct ModSpace {
     pub calendar_weekdays: bool,
     /// With `calendar_weekdays`: every round that many weeks later (0 = none).
     pub calendar_weeks: u32,
+    /// The European Cup as a 36-club league phase (`lma_data::diary::league_phase_archive`, the
+    /// draw, table and knockout hooks in `hooks`, #703).
+    pub league_phase: bool,
     /// GBP per unit of a player's stored u16 value (None: the vanilla 1000; `guest::rec::VALUE_UNIT`).
     pub value_unit: Option<u32>,
     /// Factor on the clubs' gate receipts, sponsorship and prize money (`hooks::add_funds`).
@@ -189,6 +219,10 @@ pub struct ModSpace {
     /// offers a 2006-scale wage from his rating, so with wages.csv's real wages every player refused
     /// (the maintainer, 13 Oct: a GBP 331k player offered 26k, #663).
     pub ai_wage_offers: bool,
+    /// Factor on the wage from a player's rating (`hooks::RATING_WAGE`, #704): the 2006 table a new
+    /// player's wage, his demands and the AI's offers start from. Clipped by the league-status caps
+    /// (0x820055a8) first, so it scales those too; then rounded and capped like any wage.
+    pub rating_wage_scale: Option<f64>,
     /// European places per league (`hooks::EUROPE_PLACES`, #607): [Champions League group stage,
     /// its qualifying round, UEFA Cup] for each of the 8 nations in LMA's country order (England,
     /// Scotland, Italy, Spain, Germany, France, Netherlands, Portugal). Vanilla (2006): England
@@ -205,6 +239,9 @@ pub struct ModSpace {
     /// language's table (`build_strings`), `patch_formations` writes them into the caption's id list.
     pub formation_string_ids: std::sync::OnceLock<Vec<u32>>,
     pub patches: Vec<Patch>,
+    /// `[tune]`'s numbers as (slot in `guest::tune::TUNABLES`, the value or a table's values; a float's
+    /// bits), checked against the entry's range and length.
+    pub tune: Vec<(usize, Vec<i32>)>,
 }
 
 /// One row of a mod's formations.csv: the formation's slot in the game's tables (0-13 vanilla,
@@ -379,6 +416,11 @@ impl ModSpace {
                 return Err(format!("{}: value_unit {u} must be 1000-100000 and divide 1,000,000 (e.g. 2000, 5000, 10000)", path.display()));
             }
         }
+        if let Some(s) = m.rating_wage_scale {
+            if !(1.0..=20.0).contains(&s) {
+                return Err(format!("{}: rating_wage_scale {s} must be 1-20", path.display()));
+            }
+        }
         if let Some(s) = m.income_scale {
             if !(0.1..=100.0).contains(&s) {
                 return Err(format!("{}: income_scale {s} must be 0.1-100", path.display()));
@@ -398,6 +440,38 @@ impl ModSpace {
             if m.sponsor_offer_scale.is_none() || c.len() != 8 || c.iter().any(|v| !(0.01..=10.0).contains(v)) {
                 return Err(format!("{}: sponsor_offer_country {c:?} must be 8 values of 0.01-10 (England, Scotland, Italy, Spain, Germany, France, Netherlands, Portugal), with sponsor_offer_scale", path.display()));
             }
+        }
+        let mut tune = Vec::new();
+        for (name, v) in &m.tune {
+            let i = guest::tune::by_name(name).ok_or_else(|| {
+                let known: Vec<&str> = guest::tune::TUNABLES.iter().map(|t| t.name).collect();
+                format!("{}: [tune] {name} is not a game number this build knows (known: {})", path.display(), known.join(", "))
+            })?;
+            let t = &guest::tune::TUNABLES[i];
+            if t.kind == guest::tune::Kind::F32 {
+                let x = match v {
+                    TuneValue::One(x) => *x as f64,
+                    TuneValue::Real(x) => *x,
+                    TuneValue::Many(_) => return Err(format!("{}: [tune] {name} is one number ({})", path.display(), t.what)),
+                };
+                let (lo, hi) = (t.min as f64 / 100.0, t.max as f64 / 100.0);
+                if !(lo..=hi).contains(&x) {
+                    return Err(format!("{}: [tune] {name} = {x} must be {lo}..={hi} ({})", path.display(), t.what));
+                }
+                tune.push((i, vec![(x as f32).to_bits() as i32]));
+                continue;
+            }
+            let vals: Vec<i64> = match (t.kind, v) {
+                (guest::tune::Kind::Imm(_), TuneValue::One(x)) => vec![*x],
+                (guest::tune::Kind::Table(n) | guest::tune::Kind::Bytes(n), TuneValue::Many(xs)) if xs.len() == n as usize => xs.clone(),
+                (guest::tune::Kind::Imm(_), _) => return Err(format!("{}: [tune] {name} is one whole number ({})", path.display(), t.what)),
+                (guest::tune::Kind::Table(n) | guest::tune::Kind::Bytes(n), _) => return Err(format!("{}: [tune] {name} is a table of {n} numbers ({})", path.display(), t.what)),
+                (guest::tune::Kind::F32, _) => unreachable!("handled above"),
+            };
+            if let Some(x) = vals.iter().find(|x| !(t.min as i64..=t.max as i64).contains(x)) {
+                return Err(format!("{}: [tune] {name}: {x} must be {}..={} ({})", path.display(), t.min, t.max, t.what));
+            }
+            tune.push((i, vals.into_iter().map(|x| x as i32).collect()));
         }
         if let Some(c) = m.ai_signing_wage_cap {
             if !(100_000..=10_000_000).contains(&c) {
@@ -449,7 +523,7 @@ impl ModSpace {
             parse_addr(&p.addr).map_err(|e| format!("{}: {e}", path.display()))?;
         }
         let formations = m.formations.as_deref().map(|f| read_formations(&dir.join(f))).transpose()?;
-        Ok(Self { id: id.to_string(), name: m.name.unwrap_or_else(|| id.to_string()), version: m.version.unwrap_or_default(), base, dir, base_year: m.base_year, calendar_weekdays: m.calendar_weekdays.unwrap_or(false), calendar_weeks: m.calendar_weeks.unwrap_or(0), ai_signing_wage_cap: m.ai_signing_wage_cap, value_unit: m.value_unit, income_scale: m.income_scale, gate_scale: m.gate_scale, wage_cap: m.wage_cap, sponsor_offer_scale: m.sponsor_offer_scale, sponsor_offer_country: m.sponsor_offer_country, sponsor_unit: m.sponsor_unit, board_share: m.board_share, values_as_stored: m.values_as_stored, wage_budget_cap: m.wage_budget_cap, subs: m.subs, bench: m.bench, ai_wage_offers: m.ai_wage_offers, europe_places: m.europe_places, formations, formation_string_ids: std::sync::OnceLock::new(), patches: m.patch })
+        Ok(Self { id: id.to_string(), name: m.name.unwrap_or_else(|| id.to_string()), version: m.version.unwrap_or_default(), base, dir, base_year: m.base_year, calendar_weekdays: m.calendar_weekdays.unwrap_or(false), calendar_weeks: m.calendar_weeks.unwrap_or(0), league_phase: m.league_phase.unwrap_or(false), value_unit: m.value_unit, income_scale: m.income_scale, gate_scale: m.gate_scale, wage_cap: m.wage_cap, ai_signing_wage_cap: m.ai_signing_wage_cap, rating_wage_scale: m.rating_wage_scale, sponsor_offer_scale: m.sponsor_offer_scale, sponsor_offer_country: m.sponsor_offer_country, sponsor_unit: m.sponsor_unit, board_share: m.board_share, values_as_stored: m.values_as_stored, wage_budget_cap: m.wage_budget_cap, subs: m.subs, bench: m.bench, ai_wage_offers: m.ai_wage_offers, europe_places: m.europe_places, formations, formation_string_ids: std::sync::OnceLock::new(), patches: m.patch, tune })
     }
 
     /// Apply the mod's code patches to the loaded image in `mem`: the base year over the `.text`
@@ -563,10 +637,19 @@ impl ModSpace {
         if let Some(n) = self.bench {
             // the 16 match slots stay; reserves 16.. come on through the native slot lookup (#530)
             crate::hooks::BENCH_EXTRA.store(n - 5, std::sync::atomic::Ordering::Relaxed);
+            // and the team screen labels them as substitutes: rows 11..11 + n (unless [tune] says)
+            if let Some(i) = guest::tune::by_name("sub_label_rows").filter(|i| !self.tune.iter().any(|(j, _)| j == i)) {
+                let t = &guest::tune::TUNABLES[i];
+                if mem.read32(t.site) == t.word() {
+                    mem.write32(t.site, guest::tune::with_imm(t.word(), 11 + n as i32));
+                    guest::tune::TUNE[i].store(11 + n as i32, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             if n > 5 {
                 notes.push(format!("{n} substitutes: the {} reserves after the matchday 16 can come on too", n - 5));
             }
         }
+        crate::hooks::LEAGUE_PHASE.store(self.league_phase, std::sync::atomic::Ordering::Relaxed);
         if let Some(scale) = self.sponsor_offer_scale.as_ref().filter(|s| !s.is_empty()) {
             // the shirt sponsorship base table: [country][division 0-4][16 club levels], x GBP 250 a
             // week; its readers (the offer list 0x8214d538, the AI's deals 0x8212b6f0) then draw
@@ -601,6 +684,42 @@ impl ModSpace {
             }
             guest::rec::WAGE_OFFER_CAP.store(cap, std::sync::atomic::Ordering::Relaxed);
             notes.push(format!("wage cap GBP {cap} a week on contract offers (vanilla 250,000)"));
+        }
+        for (i, vals) in &self.tune {
+            // a game number by name (#870): an instruction's immediate (the word for the interpreter,
+            // the slot for the recompiled code) or a table's data words
+            let t = &guest::tune::TUNABLES[*i];
+            match t.kind {
+                guest::tune::Kind::Imm(_) => {
+                    for (site, word) in guest::tune::sites(t) {
+                        let w = mem.read32(site);
+                        if w != word {
+                            return Err(format!("mod {}: [tune] {}: {site:#x} is {w:#x}, not the game's {word:#x}", self.id, t.name));
+                        }
+                    }
+                    for (site, word) in guest::tune::sites(t) {
+                        mem.write32(site, guest::tune::with_imm(word, vals[0]));
+                    }
+                    guest::tune::TUNE[*i].store(vals[0], std::sync::atomic::Ordering::Relaxed);
+                    notes.push(format!("{} = {}: {}", t.name, vals[0], t.what));
+                }
+                guest::tune::Kind::F32 => {
+                    mem.write32(t.site, vals[0] as u32);
+                    notes.push(format!("{} = {}: {}", t.name, f32::from_bits(vals[0] as u32), t.what));
+                }
+                guest::tune::Kind::Table(_) => {
+                    for (k, &v) in vals.iter().enumerate() {
+                        mem.write32(t.site + 4 * k as u32, v as u32);
+                    }
+                    notes.push(format!("{} = {vals:?}: {}", t.name, t.what));
+                }
+                guest::tune::Kind::Bytes(_) => {
+                    for (k, &v) in vals.iter().enumerate() {
+                        mem.write8(t.site + k as u32, v as u8);
+                    }
+                    notes.push(format!("{} = {vals:?}: {}", t.name, t.what));
+                }
+            }
         }
         if let Some(cap) = self.ai_signing_wage_cap {
             // the completion check's GBP 100,000 ceiling for AI buyers (#704)
@@ -680,6 +799,10 @@ impl ModSpace {
         }
         let names = (0..db.club_count()).map(|ci| db.club_name(ci).to_string()).collect();
         let mut built = db.build().map_err(|e| format!("mod {}: {e}", self.id))?;
+        if self.league_phase {
+            built = league_phase_diary(&built).map_err(|e| format!("mod {}: league_phase: {e}", self.id))?;
+            notes.push("European Cup: a league phase of 36 clubs (8 matchdays of 18), a play-off (13/14), the last 16 a week on".into());
+        }
         if let (true, Some(year)) = (self.calendar_weekdays, self.base_year) {
             built = retime_diary(&built, year as i32, self.calendar_weeks).map_err(|e| format!("mod {}: calendar_weekdays: {e}", self.id))?;
             notes.push(format!("calendar: every round on its weekday in {year}/{} (shifted {:+} days)", (year + 1) % 100, lma_data::diary::weekday_shift(lma_data::diary::FIRST_YEAR, year as i32) + 7 * self.calendar_weeks as i64));
@@ -796,6 +919,10 @@ impl ModSpace {
         crate::hooks::AI_WAGE_OFFERS.store(self.ai_wage_offers, std::sync::atomic::Ordering::Relaxed);
         if self.ai_wage_offers {
             notes.push(format!("AI wage offers: at least the player's wage + 10%, wages up to GBP {} a week", crate::hooks::WAGE_MAX));
+        }
+        crate::hooks::RATING_WAGE_SCALE.store(self.rating_wage_scale.map_or(1000, |s| (s * 1000.0).round() as u32), std::sync::atomic::Ordering::Relaxed);
+        if let Some(s) = self.rating_wage_scale {
+            notes.push(format!("wages from ratings (new players, demands, AI offers) x {s}"));
         }
         if let Some(places) = &self.europe_places {
             *crate::hooks::EUROPE_PLACES_TABLE.write().unwrap() = places.clone();
@@ -1658,6 +1785,107 @@ mod tests {
         std::fs::remove_dir_all(&r).unwrap();
     }
 
+    /// The `[tune]` tests share `guest::tune::TUNE` (one per process) and two of them reset it: run them
+    /// one at a time (a reset between another test's patch and its check failed it now and then).
+    static TUNE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `[tune]` sets a game number by name: the word for the interpreter, the slot the recompiled code
+    /// reads; an unknown name, a value out of range or a wrong word is refused.
+    #[test]
+    fn tune_sets_a_game_number_by_name() {
+        let _serial = TUNE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let r = root("tune", &[("p", "[tune]\nprime_wage_premium = 15\n"), ("high", "[tune]\nprime_wage_premium = 150\n"), ("x", "[tune]\nno_such_number = 1\n"), ("arr", "[tune]\nprime_wage_premium = [15]\n")]);
+        assert!(ModSpace::load(&r, "high").unwrap_err().contains("must be 0..=100"));
+        assert!(ModSpace::load(&r, "arr").unwrap_err().contains("is one whole number"));
+        assert!(ModSpace::load(&r, "x").unwrap_err().contains("not a game number this build knows (known: prime_wage_premium"));
+        let m = ModSpace::load(&r, "p").unwrap();
+        let i = guest::tune::by_name("prime_wage_premium").unwrap();
+        let t = &guest::tune::TUNABLES[i];
+        let mut mem = guest::mem::Memory::new();
+        mem.write32(t.site, t.word());
+        let notes = m.patch_image(&mut mem, (0x8200_0000, 0)).unwrap();
+        assert_eq!(notes, vec![format!("prime_wage_premium = 15: {}", t.what)]);
+        assert_eq!(mem.read32(t.site), 0x1D7F_000F, "mulli r11,r31,15");
+        assert_eq!(guest::tune::tune(i), 15);
+        guest::tune::reset();
+        assert_eq!(guest::tune::tune(i), 35);
+        assert!(m.patch_image(&mut mem, (0x8200_0000, 0)).unwrap_err().contains("not the game's 0x1d7f0023"));
+        guest::tune::reset();
+        std::fs::remove_dir_all(&r).unwrap();
+    }
+
+    /// A `[tune]` table is an array of its length, every value in range, written over the data words.
+    #[test]
+    fn tune_sets_a_table_by_name() {
+        let _serial = TUNE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let row = |v: i64, n: usize| format!("[tune]\ndemand_status_pct = [{}]\n", vec![v.to_string(); n].join(", "));
+        let (ok, big) = (row(5, 12), row(500, 12));
+        let r = root("tunet", &[("t", ok.as_str()), ("short", "[tune]\ndemand_status_pct = [1, 2]\n"), ("one", "[tune]\ndemand_status_pct = 4\n"), ("big", big.as_str())]);
+        assert!(ModSpace::load(&r, "short").unwrap_err().contains("a table of 12 numbers"));
+        assert!(ModSpace::load(&r, "one").unwrap_err().contains("a table of 12 numbers"));
+        assert!(ModSpace::load(&r, "big").unwrap_err().contains("500 must be -100..=200"));
+        let m = ModSpace::load(&r, "t").unwrap();
+        let t = &guest::tune::TUNABLES[guest::tune::by_name("demand_status_pct").unwrap()];
+        let mut mem = guest::mem::Memory::new();
+        m.patch_image(&mut mem, (0x8200_0000, 0)).unwrap();
+        assert_eq!((0..12).map(|k| mem.read32(t.site + 4 * k)).collect::<Vec<_>>(), vec![5; 12]);
+        assert_eq!(mem.read32(t.site + 4 * 12), 0, "nothing past the table");
+        std::fs::remove_dir_all(&r).unwrap();
+    }
+
+    #[test]
+    fn tune_sets_a_byte_table_by_name() {
+        let _serial = TUNE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let row = |v: i64| format!("[tune]\nfunds_nation_factor = [{}]\n", vec![v.to_string(); 52].join(", "));
+        let (ok, big) = (row(7), row(300));
+        let r = root("tuneb", &[("t", ok.as_str()), ("big", big.as_str())]);
+        assert!(ModSpace::load(&r, "big").unwrap_err().contains("300 must be 0..=255"));
+        let m = ModSpace::load(&r, "t").unwrap();
+        let t = &guest::tune::TUNABLES[guest::tune::by_name("funds_nation_factor").unwrap()];
+        let mut mem = guest::mem::Memory::new();
+        m.patch_image(&mut mem, (0x8200_0000, 0)).unwrap();
+        assert_eq!((0..52).map(|k| mem.read8(t.site + k)).collect::<Vec<_>>(), vec![7; 52]);
+        assert_eq!(mem.read8(t.site + 52), 0, "nothing past the table");
+        std::fs::remove_dir_all(&r).unwrap();
+    }
+
+    /// A rule the game checks in several places is one name: every site is checked, then rewritten.
+    #[test]
+    fn tune_sets_every_site_of_a_number() {
+        let _serial = TUNE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let r = root("tunes", &[("s", "[tune]\nsale_min_squad = 20\n")]);
+        let m = ModSpace::load(&r, "s").unwrap();
+        let t = &guest::tune::TUNABLES[guest::tune::by_name("sale_min_squad").unwrap()];
+        let mut mem = guest::mem::Memory::new();
+        let sites = guest::tune::sites(t);
+        assert_eq!(sites.len(), 2);
+        mem.write32(sites[0].0, sites[0].1);
+        assert!(m.patch_image(&mut mem, (0x8200_0000, 0)).unwrap_err().contains(&format!("{:#x} is 0x0", sites[1].0)), "the second site is checked too");
+        assert_eq!(mem.read32(sites[0].0), sites[0].1, "nothing written when a site is wrong");
+        for &(a, w) in &sites {
+            mem.write32(a, w);
+        }
+        m.patch_image(&mut mem, (0x8200_0000, 0)).unwrap();
+        assert_eq!(sites.iter().map(|&(a, _)| mem.read32(a) & 0xFFFF).collect::<Vec<_>>(), [20, 20]);
+        guest::tune::reset();
+        std::fs::remove_dir_all(&r).unwrap();
+    }
+
+    /// A float takes a number with or without a fraction, in range, written as its bits.
+    #[test]
+    fn tune_sets_a_float_by_name() {
+        let _serial = TUNE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let r = root("tunef", &[("f", "[tune]\nasking_price_top_factor = 1.25\n"), ("i", "[tune]\nasking_price_top_factor = 2\n"), ("big", "[tune]\nasking_price_top_factor = 50.0\n")]);
+        assert!(ModSpace::load(&r, "big").unwrap_err().contains("must be 0.5..=10"));
+        let t = &guest::tune::TUNABLES[guest::tune::by_name("asking_price_top_factor").unwrap()];
+        let mut mem = guest::mem::Memory::new();
+        ModSpace::load(&r, "f").unwrap().patch_image(&mut mem, (0x8200_0000, 0)).unwrap();
+        assert_eq!(f32::from_bits(mem.read32(t.site)), 1.25);
+        ModSpace::load(&r, "i").unwrap().patch_image(&mut mem, (0x8200_0000, 0)).unwrap();
+        assert_eq!(f32::from_bits(mem.read32(t.site)), 2.0);
+        std::fs::remove_dir_all(&r).unwrap();
+    }
+
     /// `ai_signing_wage_cap` rewrites the completion check's GBP 100,000 pair for the interpreter and sets
     /// the atomic the recompiled code reads; out of range or on a wrong word it is refused.
     #[test]
@@ -1700,6 +1928,14 @@ mod tests {
         mem.write32(guest::rec::WAGE_OFFER_CAP_SITES[0].1, 0x6000_0000);
         assert!(m.patch_image(&mut mem, (0x8200_0000, 0)).unwrap_err().contains("not the GBP 250,000 wage cap"));
         std::fs::remove_dir_all(&r).unwrap();
+    }
+
+    /// `rating_wage_scale` is validated and kept (1-20).
+    #[test]
+    fn rating_wage_scale_is_validated_and_set() {
+        let r = root("ratingwage", &[("w", "rating_wage_scale = 5.0\n"), ("bad", "rating_wage_scale = 0.5\n")]);
+        assert!(ModSpace::load(&r, "bad").unwrap_err().contains("1-20"));
+        assert_eq!(ModSpace::load(&r, "w").unwrap().rating_wage_scale, Some(5.0));
     }
 
     /// `income_scale` is validated, reaches the machine and hooks the balance adder; only income
@@ -1817,7 +2053,7 @@ mod tests {
         std::fs::write(r.join("s/sponsors.csv"), "id,club,shirt_gbp,ground_gbp
 0,Arsenal,50000000,20000000
 ").unwrap();
-        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false };
+        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false, resources: vec![] };
         let dir = std::env::temp_dir();
         let mut m = crate::machine::Machine::new(&x, &dir, &dir);
         let notes = ModSpace::load(&r, "s").unwrap().install(&mut m, &r.join("no-game-dir")).unwrap();
@@ -1836,7 +2072,7 @@ mod tests {
         std::fs::write(r.join("eco/funds.csv"), "id,funds_m\n0,197.59\n").unwrap();
         std::fs::write(r.join("eco/sponsors.csv"), "id,club,shirt_gbp,ground_gbp\n0,Arsenal,50000000,20000000\n").unwrap();
         std::fs::write(r.join("eco/wage_budgets.csv"), "id,bill_gbp_week,budget_gbp_week\n0,3297444,4121805\n").unwrap();
-        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false };
+        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false, resources: vec![] };
         let dir = std::env::temp_dir();
         let mut m = crate::machine::Machine::new(&x, &dir, &dir);
         let notes = ModSpace::load(&r, "eco").unwrap().install(&mut m, &r.join("no-game-dir")).unwrap();
@@ -1866,7 +2102,7 @@ mod tests {
         std::fs::write(r.join("bad/squad_overflow.csv"), "id,club_id
 4000,Arsenal
 ").unwrap();
-        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false };
+        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false, resources: vec![] };
         let dir = std::env::temp_dir();
         let mut m = crate::machine::Machine::new(&x, &dir, &dir);
         let notes = ModSpace::load(&r, "o").unwrap().install(&mut m, &r.join("no-game-dir")).unwrap();
@@ -1968,7 +2204,7 @@ mod tests {
         assert!(ModSpace::load(&r, "on").unwrap().ai_wage_offers);
         assert!(!ModSpace::load(&r, "off").unwrap().ai_wage_offers);
         std::fs::write(r.join("on/Export.mng"), lma_data::fixtures::fake_db().build().unwrap()).unwrap();
-        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false };
+        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false, resources: vec![] };
         let dir = std::env::temp_dir();
         let mut m = crate::machine::Machine::new(&x, &dir, &dir);
         let notes = ModSpace::load(&r, "on").unwrap().install(&mut m, &r.join("no-game-dir")).unwrap();

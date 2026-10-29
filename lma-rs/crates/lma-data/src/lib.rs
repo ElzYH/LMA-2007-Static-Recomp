@@ -8,8 +8,11 @@ pub mod bits;
 pub mod csv;
 pub mod db;
 pub mod diary;
+pub mod disc;
 pub mod edit;
+pub mod font;
 pub mod lang;
+pub mod league;
 #[cfg(any(test, feature = "test-fixtures"))]
 #[doc(hidden)]
 pub mod fixtures;

@@ -121,7 +121,7 @@ struct Consts {
     // where this draw's float constants start in `fvals` (vertex and pixel shader)
     vf_off: u32,
     pf_off: u32,
-    _p1: u32,
+    scaled: u32, // fetch constants bound to a resolve at resolution scale n (`gpu_wgpu::scaled_mask`)
     _p2: u32,
 };
 @group(0) @binding(0) var<storage, read> consts_arr: array<Consts>;
@@ -781,7 +781,10 @@ impl Tr {
         }
         let comps: String = (0..4).map(|i| COMP[((t.src_swiz >> (2 * i)) & 3) as usize]).collect();
         let _ = writeln!(c, "let coord = r[{}].{comps};", t.src);
-        if t.unnormalized {
+        if t.unnormalized && crate::gpu::res_scale() > 1 {
+            // a resolve kept on the GPU at resolution scale n is n times the guest's texture
+            let _ = writeln!(c, "let sc = select(1.0, {}.0, ((consts.scaled >> {k}u) & 1u) == 1u); let uv = coord.xy * sc / vec2<f32>(textureDimensions(tex{k}));", crate::gpu::res_scale());
+        } else if t.unnormalized {
             let _ = writeln!(c, "let uv = coord.xy / vec2<f32>(textureDimensions(tex{k}));");
         } else {
             c.push_str("let uv = coord.xy;\n");

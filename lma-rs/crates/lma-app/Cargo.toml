@@ -23,3 +23,9 @@ lma-data = { version = "0.1.0", path = "../lma-data" }
 tracy = ["runtime/tracy"]
 # XMA audio through FFmpeg (#199; see runtime's feature)
 xma-ffmpeg = ["runtime/xma-ffmpeg"]
+
+# the Dock icon from the player's own default.xex at run time (macOS): the same objc2 crates winit uses
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = ["NSData"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSImage", "NSResponder"] }

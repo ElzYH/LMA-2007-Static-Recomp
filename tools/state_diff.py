@@ -16,6 +16,7 @@ prints to Ghidra (~/lma/refs/ghidra/export/xrefs.tsv, or pyghidra-mcp) for the r
 (the maintainer, 11 Oct: the player form field, funds between team select and the hub, contract years).
 """
 import argparse
+import hashlib
 import os
 import struct
 import subprocess
@@ -40,20 +41,23 @@ def default_cli():
 
 def dump(state, cli, xex, keep=None):
     """Path of the sparse memory image of `state` (made with lma-cli state-mem, cached by mtime)."""
-    out = os.path.join(keep or tempfile.gettempdir(), os.path.basename(state) + ".mem")
+    # the full path in the name: a/x.state and b/x.state must not share one cached dump
+    tag = hashlib.sha1(os.path.abspath(state).encode()).hexdigest()[:8]
+    out = os.path.join(keep or tempfile.gettempdir(), f"{os.path.basename(state)}.{tag}.mem")
     if not (os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(state)):
         subprocess.run([cli, "state-mem", xex, state, out], check=True, stdout=subprocess.DEVNULL)
     return out
 
 
-def ranges(addrs):
-    """Sorted addresses grouped into contiguous runs: [(start, end_exclusive)]."""
+def ranges(addrs, w=4):
+    """Sorted addresses of w-byte words grouped into runs (a gap of one unchanged word joins two):
+    [(start, end_exclusive)]."""
     out = []
     for a in sorted(addrs):
-        if out and a <= out[-1][1] + 4:
-            out[-1][1] = a + 4
+        if out and a <= out[-1][1] + w:
+            out[-1][1] = a + w
         else:
-            out.append([a, a + 4])
+            out.append([a, a + w])
     return [(s, e) for s, e in out]
 
 
@@ -115,7 +119,7 @@ def main():
         for addr, x, y in changed[: a.limit]:
             print(f"  {addr:#010x}: {x} -> {y}")
         return
-    rs = ranges(addr for addr, _, _ in changed)
+    rs = ranges((addr for addr, _, _ in changed), w)
     print(f"{len(changed)} changed words in {len(rs)} ranges")
     for s, e in rs[: a.limit]:
         print(f"  {s:#010x}-{e:#010x} ({e - s} bytes)")

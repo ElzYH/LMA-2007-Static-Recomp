@@ -22,7 +22,10 @@
 /// `runtime::hooks::SLOT_LOOKUP`, `MATCH_BUILD`, #530), and the wage rounding and the AI's wage
 /// offer (mod `ai_wage_offers`, `runtime::hooks::WAGE_ROUND`, `AI_OFFER`), and the tactics record's
 /// per-formation position offsets and the pitch diagram's slot placement (mod formations.csv,
-/// `runtime::hooks::FORMATION_OFFSET_*`, `FORMATION_DIAGRAM_SLOT`, #749), and the team screen's
+/// `runtime::hooks::FORMATION_OFFSET_*`, `FORMATION_DIAGRAM_SLOT`, #749), the wage from a player's
+/// rating (mod `rating_wage_scale`, `runtime::hooks::RATING_WAGE`, #704), and the team screen's
 /// setup and its row lookups (mod `bench`, `runtime::hooks::TEAM_SCREEN_SETUP`,
-/// `TEAM_ROW_PLAYER`, `TEAM_ROW_STATUS`, #530).
-pub const ADDRESSES: &[u32] = &[0x8233_98A0, 0x8233_9CA8, 0x8233_93D0, 0x8234_02F8, 0x8233_6958, 0x820E_39D8, 0x820E_4018, 0x8212_08E0, 0x8211_DCB0, 0x8212_3DC8, 0x8210_4CD8, 0x8211_C658, 0x820E_AA10, 0x8233_9080, 0x8210_75A0, 0x8210_7608, 0x8210_71C8, 0x8210_7200, 0x8210_7DB8, 0x8210_7E60, 0x820E_6BE0, 0x820E_3970, 0x8211_8FC0, 0x820E_6B80, 0x8211_F4C8, 0x8211_BE88, 0x8213_8E68, 0x8217_94C8, 0x8225_EDF0, 0x8225_BF10, 0x8211_8E88, 0x8218_7738, 0x8225_EDC0, 0x8210_F330, 0x8210_F3F8, 0x8210_F4A8, 0x8210_F570, 0x8219_1B40, 0x8218_F068, 0x8218_F750, 0x8219_0BC8];
+/// `TEAM_ROW_PLAYER`, `TEAM_ROW_STATUS`, #530), and the European Cup's draw, its group stage's
+/// end and the cup screens' standings reader (mod `league_phase`, `runtime::hooks::EUROPEAN_CUP_DRAW`,
+/// `GROUP_END`, `STANDINGS_READ`, #703).
+pub const ADDRESSES: &[u32] = &[0x8233_98A0, 0x8233_9CA8, 0x8233_93D0, 0x8234_02F8, 0x8233_6958, 0x820E_39D8, 0x820E_4018, 0x8212_08E0, 0x8211_DCB0, 0x8212_3DC8, 0x8210_4CD8, 0x8211_C658, 0x820E_AA10, 0x8233_9080, 0x8210_75A0, 0x8210_7608, 0x8210_71C8, 0x8210_7200, 0x8210_7DB8, 0x8210_7E60, 0x820E_6BE0, 0x820E_3970, 0x8211_8FC0, 0x820E_6B80, 0x8211_F4C8, 0x8211_BE88, 0x8213_8E68, 0x8217_94C8, 0x8225_EDF0, 0x8225_BF10, 0x8211_8E88, 0x8218_7738, 0x8225_EDC0, 0x8210_F330, 0x8210_F3F8, 0x8210_F4A8, 0x8210_F570, 0x8219_1B40, 0x8212_0D38, 0x8218_F068, 0x8218_F750, 0x8219_0BC8, 0x8213_94A8, 0x8213_A2D0, 0x820D_F370];

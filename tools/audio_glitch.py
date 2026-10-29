@@ -2,7 +2,6 @@
 """Find audio glitches in a WAV the game wrote (LMA_AUDIO_DUMP / LMA_AUDIO_WAV, #199).
 
     tools/audio_glitch.py out.wav [--json]
-    tools/audio_glitch.py --selftest
 
 Reports, with timestamps:
 - loops: stretches where the sound repeats itself almost exactly at a short lag (20-200 ms), what a
@@ -10,7 +9,7 @@ Reports, with timestamps:
   noise don't repeat that exactly;
 - gaps: sudden silences of 20-500 ms cutting into continuous sound (cuts, underruns);
 - clipping: runs of samples at full scale.
-Exit status 1 if anything was found. Needs numpy.
+Exit status 1 if anything was found. Needs numpy. Tests: tools/test_audio_glitch.py
 """
 import json
 import sys
@@ -94,33 +93,9 @@ def clipping(a, rate):
     return out
 
 
-def selftest():
-    """Synthetic crowd noise: clean, with a 100 ms cut, with a 60 ms stretch looping for a second,
-    and with a clipped burst. Each must be found, and only it."""
-    rng = np.random.default_rng(1)
-    rate = RATE
-    crowd = lambda n: rng.normal(0, 3000, n).astype(np.float32)
-    clean = crowd(3 * rate)
-    assert not loops(clean, rate) and not gaps(clean, rate), "clean crowd noise"
-    cut = clean.copy()
-    cut[rate:rate + rate // 10] = 0
-    g = gaps(cut, rate)
-    assert len(g) == 1 and abs(g[0]["start"] - 1.0) < 0.01 and 95 <= g[0]["ms"] <= 105, g
-    looped = clean.copy()
-    piece = looped[rate:rate + rate * 60 // 1000]
-    looped[rate:2 * rate] = np.tile(piece, 1000 // 60 + 1)[:rate]
-    lp = loops(looped, rate)
-    assert len(lp) == 1 and abs(lp[0]["lag_ms"] - 60) < 2, lp
-    clipped = np.stack([clean, clean], axis=1)
-    clipped[rate:rate + 100] = 32767
-    c = clipping(clipped, rate)
-    assert len(c) == 1 and c[0]["samples"] == 100, c
-    print("selftest ok: a cut, a loop and clipping found; clean noise passes")
-
-
 def main():
-    if sys.argv[1] == "--selftest":
-        return selftest()
+    if len(sys.argv) < 2 or sys.argv[1].startswith("--"):
+        sys.exit(__doc__)
     path = sys.argv[1]
     a, rate = load(path)
     mono = a.mean(axis=1)

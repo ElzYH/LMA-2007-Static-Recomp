@@ -213,7 +213,8 @@ pub fn weekday_shift(from: i32, to: i32) -> i64 {
 /// competition round and every scheduled date (kind 0 records, kind 1 entries) on its old weekday:
 /// each keeps its days from 1 July plus `weekday_shift`, so a Saturday round stays a Saturday
 /// (`base_year = 2026` alone moves 2006's Saturday 12 Aug to Wednesday 12 Aug 2026, #703). The
-/// season's start, the end and the schedules' own days stay on their dates; the records are sorted
+/// schedules' own days move with the rounds (a schedule on the season's first day stays there); the
+/// season's start and the end stay on their dates; the records are sorted
 /// again by date (stable). The result packs its dates from `to_year`. `weeks` moves every round and
 /// scheduled date that many weeks later on top (`calendar_weeks`: 2026/27's leagues open a week after
 /// the disc's, #703).
@@ -239,7 +240,14 @@ pub fn retime(diary: &[u8], index: u32, to_year: i32, weeks: u32) -> Result<Vec<
     let moved = |date: (i32, u32, u32)| civil_from_days(days_from_civil(date) - start_from + start_to + shift);
     let mut keyed = Vec::with_capacity(recs.len());
     for (i, mut r) in recs.drain(..).enumerate() {
-        let date = if r.kind == 0 { moved(r.date) } else { kept(r.date)? };
+        // a schedule moves with the rounds too, so the group draw the day after the last qualifying
+        // round stays after it (kept, 24 Aug came before the qualifiers' 2nd leg on 26 Aug, #703);
+        // one on the season's first day stays there
+        let date = match r.kind {
+            0 => moved(r.date),
+            1 if days_from_civil(r.date) > start_from => civil_from_days(days_from_civil(moved(r.date)).max(start_to)),
+            _ => kept(r.date)?,
+        };
         if r.kind != 3 && !(start_to..days_from_civil(end)).contains(&days_from_civil(date)) {
             return Err(Error::Format(format!("diary {index}: a round moves to {date:?}, outside the season")));
         }
@@ -275,6 +283,215 @@ pub fn retime_archive(diary20: &[u8], to_year: i32, weeks: u32) -> Result<Vec<u8
         let name = format!("diary{k:04}.bin");
         let Some(d) = ar.get(&name) else { continue };
         let new = retime(d, k, to_year, weeks)?;
+        ar.set(&name, new);
+    }
+    Ok(ar.build())
+}
+
+/// The European Cup in the diary (#703): competition 55 (0x37); its round ids.
+pub const EUROPEAN_CUP: u8 = 55;
+const GROUP_ROUND: u8 = 42;
+const LAST_16: [u8; 2] = [9, 10];
+const QUARTER_FINAL: u8 = 28;
+/// The 2024+ league phase: 8 matchdays of 18 games (36 clubs), then a two-legged play-off of 8 ties.
+pub const LEAGUE_DAYS: usize = 8;
+pub const LEAGUE_GAMES: u8 = 18;
+pub const PLAYOFF_TIES: u8 = 8;
+/// The play-off's round ids: a two-legged pair the European Cup doesn't use (the game's round
+/// kinds: 0x820ee4d8 the two-legged rounds, 0x820ee2f8 their second legs, 0x820ee5a8 the single
+/// games), so its round-done code (0x8213a718) collects the winners as for any knockout round. 13/14
+/// are the UEFA Cup's last-32 ids; the draw for it is the hook's (0x821394a8 draws no other id).
+pub const PLAYOFF: [u8; 2] = [13, 14];
+
+/// A day record taken apart: (days since 1970, kind, entries for kinds 0-1, the raw record for the others).
+type Day = (i64, u8, Vec<Vec<u8>>, Vec<u8>);
+
+/// A season file's European Cup in the 2024+ shape (#703 step 1), for the draw and table hooks
+/// (steps 3-4) to fill: the six group days of 16 blank games become the league phase's eight days of
+/// 18 (the disc's six, then two more on the same weekday six and seven weeks after the sixth), a
+/// two-legged play-off (`playoff` = its two round ids) of 8 blank ties takes the last 16's old days
+/// one week earlier (the week before the last 16's first leg, then that day), and the last 16 moves
+/// on a week (its second leg's old day, then a week later), before the quarter-finals. Every new round gets
+/// its schedule entry (the game's "this round is next" event: competition, round, the round's date)
+/// the day after the round before it, as the disc does for the group days; the quarter-finals keep
+/// theirs. The diary is the disc's (dates from 2006, before `retime`) and grows: the game sizes its
+/// buffer from the file (the loader 0x822e5d48 writes the pointer to 0x82740400 and the size to
+/// 0x82740404), and a round's u8 game count takes 18.
+pub fn league_phase(diary: &[u8], index: u32, playoff: [u8; 2]) -> Result<Vec<u8>> {
+    let err = |what: String| Error::Format(format!("diary {index}: {what}"));
+    let recs = day_records(diary, FIRST_YEAR)?;
+    let used: usize = recs.iter().map(|r| r.bytes.len()).sum();
+    // a kind 0 entry is `competition, round, games, leg` + 6 bytes a game, a
+    // kind 1 entry `competition, round, u16 date`; the other kinds are kept as they are
+    let mut days: Vec<Day> = Vec::with_capacity(recs.len() + 8);
+    for r in &recs {
+        let mut entries = Vec::new();
+        if r.kind <= 1 {
+            let mut p = 6;
+            for _ in 0..r.bytes[2] {
+                let len = if r.kind == 0 { 4 + 6 * *r.bytes.get(p + 2).ok_or_else(|| err(format!("a round past its record on {:?}", r.date)))? as usize } else { 4 };
+                entries.push(r.bytes.get(p..p + len).ok_or_else(|| err(format!("an entry past its record on {:?}", r.date)))?.to_vec());
+                p += len;
+            }
+        }
+        days.push((days_from_civil(r.date), r.kind, entries, r.bytes.clone()));
+    }
+    let rounds_of = |id: u8| days.iter().filter(|d| d.1 == 0 && d.2.iter().any(|e| e[0] == EUROPEAN_CUP && e[1] == id)).map(|d| d.0).collect::<Vec<i64>>();
+    let groups = rounds_of(GROUP_ROUND);
+    let (l16a, l16b, qf) = (rounds_of(LAST_16[0]), rounds_of(LAST_16[1]), rounds_of(QUARTER_FINAL));
+    if groups.len() != 6 || l16a.len() != 1 || l16b.len() != 1 || qf.len() != 1 {
+        return Err(err(format!("the European Cup has {} group days, {}/{} last-16 legs and {} quarter-final first legs, want 6, 1/1, 1", groups.len(), l16a.len(), l16b.len(), qf.len())));
+    }
+    if playoff.iter().any(|id| !rounds_of(*id).is_empty()) {
+        return Err(err(format!("the play-off's round ids {playoff:?} are already in the European Cup")));
+    }
+    let blank = days.iter().flat_map(|d| d.2.iter()).find(|e| d_is_round(e, GROUP_ROUND)).map(|e| e[4..10].to_vec()).unwrap_or_else(|| vec![0, 0, 0, 0, 0xff, 0]);
+    let mut league = groups.clone();
+    league.extend([groups[5] + 42, groups[5] + 49]);
+    let plan: Vec<(i64, u8, u8, u8)> = league.iter().map(|&d| (d, GROUP_ROUND, LEAGUE_GAMES, 0))
+        .chain([(l16a[0] - 7, playoff[0], PLAYOFF_TIES, 0), (l16a[0], playoff[1], PLAYOFF_TIES, 1)])
+        .chain([(l16b[0], LAST_16[0], 8, 0), (l16b[0] + 7, LAST_16[1], 8, 1)])
+        .collect();
+    let seq: Vec<i64> = plan.iter().map(|p| p.0).collect();
+    if !seq.windows(2).all(|w| w[0] < w[1]) || seq[seq.len() - 1] >= qf[0] {
+        return Err(err("the league phase, play-off and last 16 don't fit before the quarter-finals".into()));
+    }
+    // out with the old group stage and last 16, rounds and schedule entries
+    let gone = |e: &Vec<u8>| e[0] == EUROPEAN_CUP && (e[1] == GROUP_ROUND || LAST_16.contains(&e[1]));
+    for d in days.iter_mut().filter(|d| d.1 <= 1) {
+        d.2.retain(|e| !gone(e));
+    }
+    let start = days_from_civil((FIRST_YEAR + index as i32, 7, 1));
+    let add = |days: &mut Vec<Day>, day: i64, kind: u8, entry: Vec<u8>| {
+        match days.iter_mut().find(|d| d.0 == day && d.1 == kind) {
+            Some(d) => d.2.insert(0, entry),
+            None => days.push((day, kind, vec![entry], Vec::new())),
+        }
+    };
+    for (k, &(day, id, games, leg)) in plan.iter().enumerate() {
+        let mut round = vec![EUROPEAN_CUP, id, games, leg];
+        for _ in 0..games {
+            round.extend_from_slice(&blank);
+        }
+        add(&mut days, day, 0, round);
+        // the first group day keeps the disc's date for its entry (the day after the qualifying round)
+        let at = if k == 0 { days_of_entry(&recs, GROUP_ROUND).unwrap_or(day - 1) } else { plan[k - 1].0 + 1 };
+        let date = pack_date(civil_from_days(day), FIRST_YEAR)?;
+        add(&mut days, at.max(start), 1, vec![EUROPEAN_CUP, id, (date >> 8) as u8, date as u8]);
+    }
+    days.retain(|d| d.1 > 1 || !d.2.is_empty());
+    days.sort_by_key(|d| (d.1 == 3, d.0, d.1 != 2, d.1));
+    let mut out = Vec::with_capacity(diary.len() + 4096);
+    for (day, kind, entries, raw) in days {
+        if kind > 1 {
+            out.extend_from_slice(&raw);
+            continue;
+        }
+        let body: Vec<u8> = entries.concat();
+        let len = u16::try_from(6 + body.len()).map_err(|_| err(format!("a day of {} bytes", 6 + body.len())))?;
+        out.extend_from_slice(&pack_date(civil_from_days(day), FIRST_YEAR)?.to_be_bytes());
+        out.extend_from_slice(&[u8::try_from(entries.len()).map_err(|_| err("a day of 256 entries".into()))?, kind]);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&body);
+    }
+    out.extend_from_slice(diary.get(used..).unwrap_or_default());
+    Ok(out)
+}
+
+/// Writes a drawn league phase into a diary `league_phase` shaped (#703, the round-42 hook): the
+/// European Cup's round-42 days in date order get their games, matchday k from `days[k]` as
+/// (home, away) club uids, each into the round's next blank (home u16, away u16, and the status's
+/// two goal nibbles 0xF, not played, as the game's 0x82133970 writes them). The diary keeps its
+/// size; the game's own copy is patched in place. Errors when the days don't match the blanks.
+pub fn fill_league_phase(diary: &mut [u8], first_year: i32, days: &[Vec<(u16, u16)>]) -> Result<()> {
+    let recs = day_records(diary, first_year)?;
+    let mut rounds = Vec::new(); // (date, offset of the round entry)
+    let mut p = 0;
+    for r in &recs {
+        if r.kind == 0 {
+            let mut e = p + 6;
+            for _ in 0..r.bytes[2] {
+                let games = *diary.get(e + 2).ok_or_else(|| Error::Format("diary: a round past the end".into()))? as usize;
+                if diary[e] == EUROPEAN_CUP && diary[e + 1] == GROUP_ROUND {
+                    rounds.push((days_from_civil(r.date), e));
+                }
+                e += 4 + 6 * games;
+            }
+        }
+        p += r.bytes.len();
+    }
+    rounds.sort_by_key(|r| r.0);
+    if rounds.len() != days.len() {
+        return Err(Error::Format(format!("diary: {} league-phase days, the draw has {}", rounds.len(), days.len())));
+    }
+    // every day checked before anything is written
+    let mut blanks = Vec::with_capacity(rounds.len());
+    for (&(_, e), games) in rounds.iter().zip(days) {
+        let blank: Vec<usize> = (0..diary[e + 2] as usize).map(|j| e + 4 + 6 * j).filter(|&f| diary[f..f + 4] == [0, 0, 0, 0]).collect();
+        if blank.len() < games.len() {
+            return Err(Error::Format(format!("diary: a league-phase day with {} blanks for {} games", blank.len(), games.len())));
+        }
+        blanks.push(blank);
+    }
+    for (blank, games) in blanks.iter().zip(days) {
+        for (&f, &(h, a)) in blank.iter().zip(games) {
+            diary[f..f + 2].copy_from_slice(&h.to_be_bytes());
+            diary[f + 2..f + 4].copy_from_slice(&a.to_be_bytes());
+            diary[f + 4] = 0xFF;
+        }
+    }
+    Ok(())
+}
+
+/// A league-phase game: (home uid, away uid, the score once played).
+pub type LeagueGame = (u16, u16, Option<(u8, u8)>);
+
+/// The league phase's games in a diary, in date order: (home uid, away uid, the score once played).
+/// The status word's high nibble is the home goals and the next the away goals; 0xE and 0xF there
+/// mean not played (`tools/diary.py`). A blank game (uid 0) is skipped.
+pub fn league_phase_results(diary: &[u8], first_year: i32) -> Result<Vec<LeagueGame>> {
+    let mut out = Vec::new();
+    for r in day_records(diary, first_year)? {
+        if r.kind != 0 {
+            continue;
+        }
+        let mut p = 6;
+        for _ in 0..r.bytes[2] {
+            let h = r.bytes.get(p..p + 4).ok_or_else(|| Error::Format(format!("diary: a round past its record on {:?}", r.date)))?;
+            let games = h[2] as usize;
+            let body = r.bytes.get(p + 4..p + 4 + 6 * games).ok_or_else(|| Error::Format(format!("diary: games past their record on {:?}", r.date)))?;
+            if h[0] == EUROPEAN_CUP && h[1] == GROUP_ROUND {
+                for g in body.as_chunks::<6>().0 {
+                    let (home, away) = (u16::from_be_bytes([g[0], g[1]]), u16::from_be_bytes([g[2], g[3]]));
+                    if home == 0 || away == 0 {
+                        continue;
+                    }
+                    let (hg, ag) = (g[4] >> 4, g[4] & 0xF);
+                    out.push((home, away, (hg < 14 && ag < 14).then_some((hg, ag))));
+                }
+            }
+            p += 4 + 6 * games;
+        }
+    }
+    Ok(out)
+}
+
+fn d_is_round(e: &[u8], id: u8) -> bool {
+    e.len() >= 10 && e[0] == EUROPEAN_CUP && e[1] == id
+}
+
+/// The day of the first schedule entry for the European Cup's round `id`.
+fn days_of_entry(recs: &[DayRecord], id: u8) -> Option<i64> {
+    recs.iter().filter(|r| r.kind == 1).find(|r| (0..r.bytes[2] as usize).any(|k| r.bytes.get(6 + 4 * k..8 + 4 * k) == Some(&[EUROPEAN_CUP, id][..]))).map(|r| days_from_civil(r.date))
+}
+
+/// `Diary20.mng` with every season's European Cup in the league-phase shape (`league_phase`).
+pub fn league_phase_archive(diary20: &[u8]) -> Result<Vec<u8>> {
+    let mut ar = Archive::parse(diary20)?;
+    for k in 0..SEASONS {
+        let name = format!("diary{k:04}.bin");
+        let Some(d) = ar.get(&name) else { continue };
+        let new = league_phase(d, k, PLAYOFF)?;
         ar.set(&name, new);
     }
     Ok(ar.build())
@@ -359,6 +576,32 @@ mod tests {
         d
     }
 
+    /// The disc's group draw is a schedule the day after the qualifiers' second leg (24 and 23 Aug
+    /// 2006); retimed to 2026, it stays the day after the leg, not on 24 Aug before it (#703).
+    #[test]
+    fn a_schedule_after_a_round_stays_after_it() {
+        let rec = |date: (i32, u32, u32), kind: u8, entries: &[u8]| {
+            let mut r = pack_date(date, 2006).unwrap().to_be_bytes().to_vec();
+            r.extend_from_slice(&[1, kind]);
+            r.extend_from_slice(&((6 + entries.len()) as u16).to_be_bytes());
+            r.extend_from_slice(entries);
+            r
+        };
+        let mut d = rec((2006, 7, 1), 2, &[0xff, 0xff]);
+        d.extend(rec((2006, 8, 23), 0, &[55, 3, 1, 1, 0, 1, 0, 2, 0xff, 0]));
+        let draw: Vec<u8> = [55u8, 42].into_iter().chain(pack_date((2006, 9, 13), 2006).unwrap().to_be_bytes()).collect();
+        d.extend(rec((2006, 8, 24), 1, &draw));
+        d.extend(rec((2006, 9, 13), 0, &[55, 42, 1, 0, 0, 1, 0, 2, 0xff, 0]));
+        d.extend(rec((2007, 6, 30), 3, &pack_date((2007, 7, 1), 2006).unwrap().to_be_bytes().into_iter().chain([0xff, 0xff]).collect::<Vec<u8>>()));
+        for weeks in [0, 1] {
+            let r = day_records(&retime(&d, 0, 2026, weeks).unwrap(), 2026).unwrap();
+            let day = |kind: u8, n: usize| days_from_civil(r.iter().filter(|r| r.kind == kind).nth(n).unwrap().date);
+            assert_eq!(day(1, 0), day(0, 0) + 1, "weeks {weeks}: the draw is the day after the qualifier");
+            let named = unpack_date(u16::from_be_bytes([r.iter().find(|r| r.kind == 1).unwrap().bytes[8], r.iter().find(|r| r.kind == 1).unwrap().bytes[9]]), 2026);
+            assert_eq!(days_from_civil(named), day(0, 1), "weeks {weeks}: it names the group day");
+        }
+    }
+
     #[test]
     fn a_retimed_round_keeps_its_weekday() {
         let d = season_records();
@@ -423,14 +666,16 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_29_february_lands_on_the_28th_in_a_year_without_one() {
-        // season 1 (2007/08) laid on 2028/29: 29 Feb 2008 has no day in 2029
+    fn a_schedule_on_29_february_moves_with_the_rounds() {
+        // season 1 (2007/08) laid on 2028/29 (no 29 Feb) and on 2031/32: the schedule keeps its
+        // days from 1 July plus the rounds' weekday shift, like the round
         let d = season(2007, &[(2007, 8, 18)], Some((2008, 2, 29)));
-        let r = day_records(&retime(&d, 1, 2027, 0).unwrap(), 2027).unwrap();
-        assert_eq!(r.iter().find(|r| r.kind == 1).unwrap().date, (2029, 2, 28));
-        // on 2031/32 the leap day is there
-        let r = day_records(&retime(&d, 1, 2030, 0).unwrap(), 2030).unwrap();
-        assert_eq!(r.iter().find(|r| r.kind == 1).unwrap().date, (2032, 2, 29));
+        for to in [2027, 2030] {
+            let r = day_records(&retime(&d, 1, to, 0).unwrap(), to).unwrap();
+            let from_july = |r: &DayRecord| days_from_civil(r.date) - days_from_civil((to + 1, 7, 1));
+            let (round, sched) = (r.iter().find(|r| r.kind == 0).unwrap(), r.iter().find(|r| r.kind == 1).unwrap());
+            assert_eq!(from_july(sched) - from_july(round), days_from_civil((2008, 2, 29)) - days_from_civil((2007, 8, 18)), "to {to}");
+        }
     }
 
     #[test]
@@ -499,6 +744,12 @@ mod tests {
                 by_comp
             };
             assert_eq!(order(&a), order(&b), "{year}, season {k}, {weeks} week(s): each competition's rounds in order");
+            // every schedule keeps the rounds before it (the group draw after the qualifiers, #703)
+            let before = |r: &[DayRecord]| {
+                let rounds: Vec<i64> = r.iter().filter(|r| r.kind == 0).map(|r| days_from_civil(r.date)).collect();
+                r.iter().filter(|r| r.kind == 1).map(|s| rounds.iter().filter(|&&d| d < days_from_civil(s.date)).count()).collect::<Vec<_>>()
+            };
+            assert_eq!(before(&a), before(&b), "{year}, season {k}, {weeks} week(s): the rounds before each schedule");
             // only dates move: every round's body (its competitions, round ids, fixtures and blank
             // European slots, e.g. 0x37's six group days of 16 blanks) comes out byte for byte
             let bodies = |r: &[DayRecord]| {
@@ -507,6 +758,197 @@ mod tests {
                 v
             };
             assert_eq!(bodies(&a), bodies(&b), "{year}, season {k}, {weeks} week(s): round bodies unchanged");
+        }
+    }
+
+    /// The European Cup's rounds as (date, round, games, leg, blank games), in date order, and its
+    /// schedule entries as (entry day, round, round date).
+    type Date = (i32, u32, u32);
+    type CupRounds = Vec<(Date, u8, u8, u8, usize)>;
+    fn cup(d: &[u8]) -> (CupRounds, Vec<(Date, u8, Date)>) {
+        let (mut rounds, mut entries) = (Vec::new(), Vec::new());
+        for r in day_records(d, FIRST_YEAR).unwrap() {
+            let mut p = 6;
+            for _ in 0..r.bytes[2] {
+                if r.kind == 0 {
+                    let h = &r.bytes[p..p + 4];
+                    let blanks = (0..h[2] as usize).filter(|j| r.bytes[p + 4 + 6 * j..p + 8 + 6 * j] == [0, 0, 0, 0]).count();
+                    if h[0] == EUROPEAN_CUP {
+                        rounds.push((r.date, h[1], h[2], h[3], blanks));
+                    }
+                    p += 4 + 6 * h[2] as usize;
+                } else if r.kind == 1 {
+                    let e = &r.bytes[p..p + 4];
+                    if e[0] == EUROPEAN_CUP {
+                        entries.push((r.date, e[1], unpack_date(u16::from_be_bytes([e[2], e[3]]), FIRST_YEAR)));
+                    }
+                    p += 4;
+                }
+            }
+        }
+        (rounds, entries)
+    }
+
+    /// A 2006/07 European Cup as the disc has it: six group days of 16 blanks, the last 16 and the
+    /// quarter-finals, each after its schedule entry, beside a league round on one of the days.
+    fn european_season() -> Vec<u8> {
+        let round = |id: u8, games: u8, leg: u8| {
+            let mut e = vec![EUROPEAN_CUP, id, games, leg];
+            for _ in 0..games {
+                e.extend_from_slice(&[0, 0, 0, 0, 0xff, 0]);
+            }
+            e
+        };
+        let entry = |id: u8, date| {
+            let w = pack_date(date, 2006).unwrap().to_be_bytes();
+            vec![EUROPEAN_CUP, id, w[0], w[1]]
+        };
+        let mut d = rec((2006, 7, 1), 2, &[0xff, 0xff], 1);
+        d.extend(rec((2006, 8, 24), 1, &entry(42, (2006, 9, 13)), 1));
+        let groups = [(2006, 9, 13), (2006, 9, 27), (2006, 10, 18), (2006, 11, 1), (2006, 11, 22), (2006, 12, 6)];
+        for (k, &g) in groups.iter().enumerate() {
+            let mut e = round(42, 16, 0);
+            if k == 2 {
+                e.extend_from_slice(&[7, 43, 1, 0, 0, 0, 0, 0, 0xff, 0]); // another league's midweek slot
+            }
+            d.extend(rec(g, 0, &e, 1 + (k == 2) as u8));
+            if k < 5 {
+                d.extend(rec(civil_from_days(days_from_civil(g) + 1), 1, &entry(42, groups[k + 1]), 1));
+            }
+        }
+        d.extend(rec((2006, 12, 15), 1, &entry(9, (2007, 2, 21)), 1));
+        d.extend(rec((2007, 2, 21), 0, &round(9, 8, 0), 1));
+        d.extend(rec((2007, 2, 22), 1, &entry(10, (2007, 3, 7)), 1));
+        d.extend(rec((2007, 3, 7), 0, &round(10, 8, 1), 1));
+        d.extend(rec((2007, 3, 16), 1, &entry(28, (2007, 3, 28)), 1));
+        d.extend(rec((2007, 3, 28), 0, &round(28, 4, 0), 1));
+        let next: Vec<u8> = pack_date((2007, 7, 1), 2006).unwrap().to_be_bytes().into_iter().chain([0xff, 0xff]).collect();
+        d.extend(rec((2007, 6, 30), 3, &next, 1));
+        d
+    }
+
+    #[test]
+    fn the_league_phase_takes_eight_days_of_eighteen_then_a_play_off() {
+        let d = european_season();
+        let out = league_phase(&d, 0, PLAYOFF).unwrap();
+        let (rounds, entries) = cup(&out);
+        let league: Vec<_> = rounds.iter().filter(|r| r.1 == 42).map(|r| (r.0, r.2, r.4)).collect();
+        assert_eq!(league.len(), LEAGUE_DAYS);
+        assert!(league.iter().all(|l| (l.1, l.2) == (18, 18)), "18 blank games a day");
+        assert_eq!(league[6].0, (2007, 1, 17), "six weeks after the sixth day, a Wednesday");
+        assert_eq!(league[7].0, (2007, 1, 24));
+        let ko: Vec<_> = rounds.iter().filter(|r| r.1 != 42).map(|r| (r.0, r.1, r.2, r.3)).collect();
+        assert_eq!(ko, [((2007, 2, 14), 13, 8, 0), ((2007, 2, 21), 14, 8, 1), ((2007, 3, 7), 9, 8, 0), ((2007, 3, 14), 10, 8, 1), ((2007, 3, 28), 28, 4, 0)]);
+        // a schedule entry before each round, naming its date; the disc's first and the quarter-final's kept
+        for r in &rounds {
+            let e = entries.iter().find(|e| e.1 == r.1 && e.2 == r.0).unwrap_or_else(|| panic!("no entry for round {} on {:?}", r.1, r.0));
+            assert!(days_from_civil(e.0) < days_from_civil(r.0));
+        }
+        assert_eq!(entries.iter().find(|e| e.2 == (2006, 9, 13)).unwrap().0, (2006, 8, 24));
+        assert_eq!(entries.iter().find(|e| e.1 == 13).unwrap().0, (2007, 1, 25), "the day after the league phase");
+        assert_eq!(entries.iter().find(|e| e.1 == 28).unwrap().0, (2007, 3, 16));
+        // the other league's slot is still on its day, and the records stay in date order
+        let recs = day_records(&out, FIRST_YEAR).unwrap();
+        let oct = recs.iter().find(|r| r.date == (2006, 10, 18) && r.kind == 0).unwrap();
+        assert_eq!(oct.bytes[2], 2);
+        assert!(recs.windows(2).all(|w| days_from_civil(w[0].date) <= days_from_civil(w[1].date)));
+        assert_eq!(recs.last().unwrap().kind, 3);
+        // retimed for 2026 like the disc's own diary
+        let r = day_records(&retime(&out, 0, 2026, 1).unwrap(), 2026).unwrap();
+        assert_eq!(r.iter().filter(|r| r.kind == 0).count(), recs.iter().filter(|r| r.kind == 0).count());
+    }
+
+    #[test]
+    fn a_drawn_league_fills_the_blanks_in_date_order() {
+        let mut d = league_phase(&european_season(), 0, PLAYOFF).unwrap();
+        let len = d.len();
+        let days: Vec<Vec<(u16, u16)>> = (0..LEAGUE_DAYS as u16).map(|k| (0..18u16).map(|g| (100 * (k + 1) + 2 * g + 1, 100 * (k + 1) + 2 * g + 2)).collect()).collect();
+        fill_league_phase(&mut d, FIRST_YEAR, &days).unwrap();
+        assert_eq!(d.len(), len, "same size");
+        let recs = day_records(&d, FIRST_YEAR).unwrap();
+        let mut seen = Vec::new();
+        for r in recs.iter().filter(|r| r.kind == 0) {
+            let mut p = 6;
+            for _ in 0..r.bytes[2] {
+                let h = &r.bytes[p..p + 4];
+                if h[0] == EUROPEAN_CUP && h[1] == 42 {
+                    let first = &r.bytes[p + 4..p + 10];
+                    seen.push((r.date, u16::from_be_bytes([first[0], first[1]]), u16::from_be_bytes([first[2], first[3]]), first[4]));
+                }
+                p += 4 + 6 * h[2] as usize;
+            }
+        }
+        assert_eq!(seen.len(), LEAGUE_DAYS);
+        assert_eq!(seen[0], ((2006, 9, 13), 101, 102, 0xFF), "matchday 1 on the first day, not played");
+        assert_eq!(seen[7], ((2007, 1, 24), 801, 802, 0xFF));
+        // a draw of the wrong shape is refused
+        assert!(fill_league_phase(&mut d.clone(), FIRST_YEAR, &days[..7]).is_err());
+        let more: Vec<Vec<(u16, u16)>> = (0..LEAGUE_DAYS).map(|_| vec![(1, 2); 19]).collect();
+        let mut fresh = league_phase(&european_season(), 0, PLAYOFF).unwrap();
+        assert!(fill_league_phase(&mut fresh, FIRST_YEAR, &more).is_err(), "19 games for 18 blanks");
+        assert_eq!(fresh, league_phase(&european_season(), 0, PLAYOFF).unwrap(), "nothing written on an error");
+    }
+
+    #[test]
+    fn the_league_phase_results_come_back_with_their_scores() {
+        let mut d = league_phase(&european_season(), 0, PLAYOFF).unwrap();
+        let days: Vec<Vec<(u16, u16)>> = (0..LEAGUE_DAYS as u16).map(|k| (0..18u16).map(|g| (100 * (k + 1) + 2 * g + 1, 100 * (k + 1) + 2 * g + 2)).collect()).collect();
+        fill_league_phase(&mut d, FIRST_YEAR, &days).unwrap();
+        let r = league_phase_results(&d, FIRST_YEAR).unwrap();
+        assert_eq!(r.len(), 144);
+        assert!(r.iter().all(|g| g.2.is_none()), "nothing played yet");
+        assert_eq!((r[0].0, r[0].1), (101, 102));
+        // the first game ends 3-1
+        let at = d.windows(4).position(|w| w == [0, 101, 0, 102]).unwrap();
+        d[at + 4] = 0x31;
+        let r = league_phase_results(&d, FIRST_YEAR).unwrap();
+        assert_eq!(r[0].2, Some((3, 1)));
+        assert_eq!(r.iter().filter(|g| g.2.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn the_league_phase_refuses_what_it_cant_place() {
+        let d = european_season();
+        assert!(league_phase(&d, 0, [9, 30]).is_err(), "a play-off id the cup already has");
+        let once = league_phase(&d, 0, PLAYOFF).unwrap();
+        assert!(league_phase(&once, 0, PLAYOFF).is_err(), "eight group days: already rewritten");
+    }
+
+    /// The disc's 20 seasons in the league-phase shape (`LMA_EXPORT=<Export.mng>`): the European
+    /// Cup's new rounds, every other competition's rounds and entries byte for byte, then retimed.
+    #[test]
+    fn the_discs_seasons_take_the_league_phase() {
+        let Ok(path) = std::env::var("LMA_EXPORT") else { return };
+        let ar = Archive::parse(&std::fs::read(path).unwrap()).unwrap();
+        let diary = Archive::parse(ar.get("Diary20.mng").unwrap()).unwrap();
+        let others = |d: &[u8]| {
+            let mut v: Vec<(i64, u8, Vec<u8>)> = Vec::new();
+            for r in day_records(d, FIRST_YEAR).unwrap() {
+                let mut p = 6;
+                for _ in 0..if r.kind <= 1 { r.bytes[2] } else { 0 } {
+                    let len = if r.kind == 0 { 4 + 6 * r.bytes[p + 2] as usize } else { 4 };
+                    if r.bytes[p] != EUROPEAN_CUP {
+                        v.push((days_from_civil(r.date), r.kind, r.bytes[p..p + len].to_vec()));
+                    }
+                    p += len;
+                }
+                if r.kind > 1 {
+                    v.push((days_from_civil(r.date), r.kind, r.bytes.clone()));
+                }
+            }
+            v.sort();
+            v
+        };
+        for k in 0..SEASONS {
+            let d = diary.get(&format!("diary{k:04}.bin")).unwrap();
+            let out = league_phase(d, k, PLAYOFF).unwrap_or_else(|e| panic!("season {k}: {e}"));
+            let (rounds, _) = cup(&out);
+            assert_eq!(rounds.iter().filter(|r| r.1 == 42 && r.2 == 18 && r.4 == 18).count(), LEAGUE_DAYS, "season {k}");
+            let ids: Vec<u8> = rounds.iter().map(|r| r.1).filter(|&id| id != 42).collect();
+            assert_eq!(ids[..2], [2, 3], "season {k}: qualifying first");
+            assert_eq!(ids[2..6], [13, 14, 9, 10], "season {k}: play-off, then the last 16");
+            assert_eq!(others(d), others(&out), "season {k}: the other competitions untouched");
+            retime(&out, k, 2026, 1).unwrap_or_else(|e| panic!("season {k} retimed: {e}"));
         }
     }
 

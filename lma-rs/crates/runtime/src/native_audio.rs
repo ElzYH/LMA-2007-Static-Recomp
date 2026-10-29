@@ -35,6 +35,10 @@ pub const SET_VOLUME: u32 = 0x8238_F728;
 pub const SET_GLOBAL: u32 = 0x8238_EFD0;
 /// Sound bank +0x8: Play (cue index r4, the new cue's pointer stored at r7 when nonzero).
 pub const PLAY: u32 = 0x8239_4FD8;
+/// Sound bank +0xc: Stop (cue index r4, 0xffff for all of the bank's cues; flags r5).
+pub const BANK_STOP: u32 = 0x8239_51F8;
+/// Sound bank +0x10: Destroy (its cues stop with it).
+pub const BANK_DESTROY: u32 = 0x8239_4D30;
 /// Cue +0xc: Destroy.
 pub const CUE_DESTROY: u32 = 0x8239_2B88;
 /// Cue +0x14: Stop.
@@ -43,7 +47,7 @@ pub const CUE_STOP: u32 = 0x8239_3290;
 pub const CUE_PAUSE: u32 = 0x8239_2D48;
 /// Cue +0x8: GetState (state written to r4): with `LMA_NATIVE_AUDIO=2` answered by the host.
 pub const CUE_GET_STATE: u32 = 0x8239_2E80;
-pub const HOOKS: [u32; 9] = [CREATE_SOUND_BANK, CREATE_WAVE_BANK, SET_VOLUME, SET_GLOBAL, PLAY, CUE_DESTROY, CUE_STOP, CUE_PAUSE, CUE_GET_STATE];
+pub const HOOKS: [u32; 11] = [CREATE_SOUND_BANK, CREATE_WAVE_BANK, SET_VOLUME, SET_GLOBAL, PLAY, BANK_STOP, BANK_DESTROY, CUE_DESTROY, CUE_STOP, CUE_PAUSE, CUE_GET_STATE];
 
 /// XACT's cue states, as GetState reports them (the game waits on PLAYING).
 const XACT_PREPARED: u32 = 0x4;
@@ -103,26 +107,48 @@ struct State {
     disk: Option<HashMap<String, PathBuf>>,
     plays: u64,
     unknown: u64,
+    /// SoundBank Stops and Destroys seen (the front end's music ends that way).
+    bank_stops: u64,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+/// The engine's mixer, for `mix`: the output device never takes `STATE`'s lock, which the hooks hold
+/// through bank parsing and live decodes (a device blocked behind those clicks or drops out).
+static MIXER: OnceLock<crate::xact::SharedMixer> = OnceLock::new();
 static GAME: OnceLock<HashMap<u32, crate::rec::FuncFn>> = OnceLock::new();
 
 /// Start the host engine for the game in `game_dir`: its global settings (categories, variables,
-/// curves) and, when the install wrote one, the decoded-audio cache in `<user_dir>/audio`.
+/// curves) and, when the install wrote one, the decoded-audio cache in `<user_dir>/audio` (a mod
+/// space's user folder falls back to its parent's, so one cache serves every version).
 pub fn init(game_dir: &Path, user_dir: &Path) {
     let settings = std::fs::read(game_dir.join("Common/MainGame/Sound/LMA2007.xgs")).ok().and_then(|d| lma_data::xact::GlobalSettings::parse(&d).ok());
     if settings.is_none() {
         eprintln!("native audio: no global settings (Common/MainGame/Sound/LMA2007.xgs): no categories or crowd curves");
     }
     let mut engine = Engine::new(settings, 512 << 20);
-    let cache = user_dir.join("audio");
-    if cache.is_dir() {
+    // a wave the install's cache lacks is decoded on its own thread, never in a hook on the game
+    // thread (a live XMA decode there stalled the game ~200 ms, #828 on the Mac)
+    engine.decoder = Some(crate::xact::Decoder::spawn());
+    // the cache holds the disc's decoded audio, the same for every version: a mod space's user
+    // folder (userdata/<mod id>) uses the one in userdata/audio when it has none of its own
+    // the install's cache (`set_audio_cache`), else LMA_AUDIO_CACHE
+    let installed = AUDIO_CACHE.lock().unwrap().clone().or_else(|| std::env::var_os("LMA_AUDIO_CACHE").map(PathBuf::from));
+    if let Some(cache) = installed.into_iter().chain([Some(user_dir), user_dir.parent()].into_iter().flatten().map(|d| d.join("audio"))).find(|d| d.is_dir()) {
         engine.cache_dir = Some(cache);
     }
     let language = std::env::var("LMA_AUDIO_LANGUAGE").unwrap_or_else(|_| "Data_01".into());
-    let state = State { engine, game_dir: game_dir.to_path_buf(), language, banks: HashMap::new(), cues: HashMap::new(), oneshots: Vec::new(), pending_cues: Vec::new(), pending_banks: Vec::new(), disk: None, plays: 0, unknown: 0 };
+    let state = State { engine, game_dir: game_dir.to_path_buf(), language, banks: HashMap::new(), cues: HashMap::new(), oneshots: Vec::new(), pending_cues: Vec::new(), pending_banks: Vec::new(), disk: None, plays: 0, unknown: 0, bank_stops: 0 };
+    let _ = MIXER.set(state.engine.mixer.clone());
     let _ = STATE.set(Mutex::new(state));
+}
+
+/// The decoded-audio cache lma-app's first-run install built (#840), set before the game starts;
+/// LMA_AUDIO_CACHE is the fallback. A static, not the environment: the app sets it from a Bevy
+/// system while other threads run, and `set_var` isn't thread-safe.
+static AUDIO_CACHE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+pub fn set_audio_cache(dir: PathBuf) {
+    *AUDIO_CACHE.lock().unwrap() = Some(dir);
 }
 
 /// The hook blocks for `HOOKS`, given the game's blocks there.
@@ -134,8 +160,8 @@ pub fn blocks_for(game: HashMap<u32, crate::rec::FuncFn>) -> Vec<(u32, crate::re
 
 /// Add the host engine's next `out.len()` frames (stereo, 48 kHz) into `out`.
 pub fn mix(out: &mut [[f32; 2]]) {
-    if let Some(s) = STATE.get() {
-        s.lock().unwrap().engine.mixer.mix(out);
+    if let Some(m) = MIXER.get() {
+        m.lock().unwrap_or_else(|p| p.into_inner()).mix(out);
     }
 }
 
@@ -143,11 +169,12 @@ pub fn mix(out: &mut [[f32; 2]]) {
 pub fn summary() -> Option<String> {
     let s = STATE.get()?.lock().unwrap();
     Some(format!(
-        "native audio: {} plays ({} on banks it couldn't find), {} sound banks known, {} voices now; waves: {} from the install's cache, {} decoded live",
+        "native audio: {} plays ({} on banks it couldn't find), {} sound bank stops, {} sound banks known, {} voices now; waves: {} from the install's cache, {} decoded live",
         s.plays,
         s.unknown,
+        s.bank_stops,
         s.banks.len(),
-        s.engine.mixer.voices(),
+        s.engine.mixer().voices(),
         s.engine.cache_reads,
         s.engine.live_decodes
     ))
@@ -272,6 +299,9 @@ fn block(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, pc: u32, b: &mut i
                 return Ok(next);
             };
             s.ensure_waves(sb);
+            // the black box: every sound started, and a sound started over and over flagged
+            let label = s.engine.cue_label(sb, r4 as usize).unwrap_or_else(|| format!("bank {sb}/cue {r4}"));
+            crate::events::sound(crate::events::secs(c.timebase), &label);
             if let Some(h) = s.engine.play_cue(sb, r4 as usize) {
                 if r7 != 0 {
                     s.pending_cues.retain(|&(at, _)| at != r7);
@@ -290,6 +320,21 @@ fn block(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, pc: u32, b: &mut i
                 !done
             });
         }
+        // the front end's music ends this way when a career starts (the maintainer, 26 Oct: it played on)
+        BANK_STOP => {
+            s.bank_stops += 1;
+            // a bank the host never saw has none of its cues; r5's "play the release" (bit 0
+            // clear) still cuts at once: the host engine has no release envelopes
+            if let Some(sb) = s.banks.get(&r3).copied() {
+                s.engine.stop_cues(sb, (r4 & 0xffff != 0xffff).then_some(r4 as usize & 0xffff));
+            }
+        }
+        BANK_DESTROY => {
+            s.bank_stops += 1;
+            if let Some(sb) = s.banks.remove(&r3) {
+                s.engine.stop_cues(sb, None);
+            }
+        }
         CUE_DESTROY => {
             if let Some(h) = s.cues.remove(&r3) {
                 s.engine.stop(h);
@@ -307,7 +352,7 @@ fn block(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, pc: u32, b: &mut i
             }
         }
         SET_GLOBAL => s.engine.set_global(r4 as usize, f1),
-        SET_VOLUME => s.engine.mixer.set_category_volume(r4 as u16, f1),
+        SET_VOLUME => s.engine.mixer().set_category_volume(r4 as u16, f1),
         _ => {}
     }
     Ok(next)

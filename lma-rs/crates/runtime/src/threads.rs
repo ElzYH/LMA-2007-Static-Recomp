@@ -32,6 +32,10 @@ pub enum Wait {
     /// A sleep a hook imposed in the middle of guest code (the fence nap, #312): the thread resumes
     /// at the hooked function with its registers as they were, so waking writes no status into r3.
     Nap(u64),
+    /// A nap that ends early once any of the guest words at `words` differs from `last` (the
+    /// native fence wait, LMA_FENCE_NAP=wait: the GPU's fence and read pointer); r3 is left alone
+    /// as for `Nap`.
+    GpuMoved { words: [u32; 2], last: [u32; 2], deadline: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -128,6 +132,7 @@ impl Machine {
                 }
             }
             Wait::Sleep(d) | Wait::Nap(d) => (self.now() >= *d).then_some(0),
+            Wait::GpuMoved { words, last, deadline } => (self.now() >= *deadline || words.iter().zip(last).any(|(&a, &l)| self.mem.read32(a) != l)).then_some(0),
             Wait::CritSec(cs) => {
                 let me = self.threads[self.cur_or_waiter(*cs)].kthread;
                 self.cs_try_enter(*cs, me).then_some(0)
@@ -266,17 +271,32 @@ impl Machine {
     pub(crate) fn wake(&mut self) -> bool {
         let mut any = false;
         for i in 0..self.threads.len() {
-            if let State::Waiting(w) = self.threads[i].state.clone() {
-                let prev = self.cur;
-                self.cur = i;
-                if let Some(status) = self.try_wait(&w) {
-                    if !matches!(w, Wait::Nap(_)) {
+            // the wait is taken out of the state, not cloned: an Objects wait's Vec was allocated
+            // and freed on every pass of the idle loop (#312: ~15% of the game thread in a menu).
+            // A critical section's stays: its owner lookup (`cur_or_waiter`) reads the state.
+            let w = match &self.threads[i].state {
+                State::Waiting(w @ Wait::CritSec(_)) => w.clone(),
+                State::Waiting(_) => match std::mem::replace(&mut self.threads[i].state, State::Ready) {
+                    State::Waiting(w) => w,
+                    _ => unreachable!(),
+                },
+                _ => {
+                    any |= self.threads[i].state == State::Ready && !self.par_running(i);
+                    continue;
+                }
+            };
+            let prev = self.cur;
+            self.cur = i;
+            match self.try_wait(&w) {
+                Some(status) => {
+                    if !matches!(w, Wait::Nap(_) | Wait::GpuMoved { .. }) {
                         self.threads[i].cpu.gpr[3] = status as u64;
                     }
                     self.threads[i].state = State::Ready;
                 }
-                self.cur = prev;
+                None => self.threads[i].state = State::Waiting(w),
             }
+            self.cur = prev;
             any |= self.threads[i].state == State::Ready && !self.par_running(i);
         }
         any
@@ -288,6 +308,7 @@ impl Machine {
             .iter()
             .filter_map(|t| match &t.state {
                 State::Waiting(Wait::Sleep(d)) | State::Waiting(Wait::Nap(d)) => Some(*d),
+                State::Waiting(Wait::GpuMoved { deadline, .. }) => Some(*deadline),
                 State::Waiting(Wait::Objects { deadline: Some(d), .. }) => Some(*d),
                 _ => None,
             })
@@ -300,7 +321,7 @@ mod tests {
     use super::*;
 
     fn machine() -> Machine {
-        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false };
+        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false, resources: vec![] };
         let dir = std::env::temp_dir();
         let mut m = Machine::new(&x, &dir, &dir);
         m.deterministic = true; // now() is the instruction clock
@@ -380,6 +401,39 @@ mod tests {
         assert_eq!(m.threads[a].cpu.gpr[3], 0x1234, "the nap kept the function's argument");
         assert_eq!(m.threads[b].state, State::Ready);
         assert_eq!(m.threads[b].cpu.gpr[3], 0, "the sleep returned its status");
+    }
+
+    /// The native fence wait (`Wait::GpuMoved`) wakes as soon as a watched word changes, else at
+    /// its deadline, and keeps r3 like a nap.
+    #[test]
+    fn a_gpu_wait_wakes_when_the_fence_moves() {
+        let mut m = machine();
+        m.clock = 1_000;
+        let (fence, rd) = (0x4000_1000u32, 0x4000_103Cu32);
+        m.mem.write32(fence, 7);
+        m.mem.write32(rd, 0x40);
+        let a = m.spawn(0x8200_0100, 0x40, 0, false, "fence wait".into());
+        m.threads[a].cpu.gpr[3] = 0x1234;
+        let wait = Wait::GpuMoved { words: [fence, rd], last: [7, 0x40], deadline: 50_000 };
+        m.threads[a].state = State::Waiting(wait.clone());
+        assert_eq!(m.next_deadline(), Some(50_000), "its bound is a deadline");
+        let ready = |m: &mut Machine| {
+            m.wake();
+            m.threads[a].state == State::Ready
+        };
+        assert!(!ready(&mut m), "nothing moved yet");
+        m.mem.write32(fence, 8);
+        assert!(ready(&mut m), "the fence moved");
+        assert_eq!(m.threads[a].cpu.gpr[3], 0x1234, "r3 kept");
+        m.mem.write32(fence, 7);
+        m.threads[a].state = State::Waiting(wait);
+        m.mem.write32(rd, 0x80);
+        assert!(ready(&mut m), "the read pointer moved");
+        m.mem.write32(rd, 0x40);
+        m.threads[a].state = State::Waiting(Wait::GpuMoved { words: [fence, rd], last: [7, 0x40], deadline: 50_000 });
+        assert!(!ready(&mut m), "back where it was");
+        m.clock = 50_000;
+        assert!(ready(&mut m), "the bound");
     }
 
     /// Critical sections: the owner may enter again (recursion), another thread may not until

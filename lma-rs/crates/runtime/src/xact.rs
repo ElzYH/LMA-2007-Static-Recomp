@@ -375,20 +375,83 @@ pub struct Engine {
     next: u64,
     globals: Vec<f32>,
     pub cache: WaveCache,
-    pub mixer: Mixer,
+    /// The voices, behind their own lock: the output device mixes from here (`native_audio::mix`)
+    /// while the engine's slow work (bank parsing, live XMA decodes) runs under the caller's lock,
+    /// so a voice change or a mix is all the device ever waits for (#772).
+    pub mixer: SharedMixer,
     /// The decoded-audio cache written at install (`userdata/audio`): banks loaded after this is
     /// set read their waves from it and decode live only what it lacks.
     pub cache_dir: Option<std::path::PathBuf>,
     /// Waves read from the install's cache, and decoded live.
     pub cache_reads: u64,
     pub live_decodes: u64,
+    /// When set, a wave neither in memory nor in the install's cache is decoded on this thread
+    /// instead of in `prepare`: that cue plays silence once and the next one has its wave, so the
+    /// caller (the game thread, for native audio) never waits for an XMA decode (#772).
+    pub decoder: Option<Decoder>,
+}
+
+/// A wave's key in the engine's cache: (wave bank index, wave index).
+type WaveKey = (u32, u32);
+
+/// The background decoder (`Engine::decoder`): one thread, waves in the order asked for.
+pub struct Decoder {
+    tx: std::sync::mpsc::Sender<(WaveKey, lma_data::xact::Wave, Vec<u8>)>,
+    done: std::sync::Arc<std::sync::Mutex<Vec<(WaveKey, Option<Pcm>)>>>,
+    pending: std::collections::HashSet<WaveKey>,
+}
+
+impl Decoder {
+    pub fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(WaveKey, lma_data::xact::Wave, Vec<u8>)>();
+        let done = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let finished = done.clone();
+        let _ = std::thread::Builder::new().name("xact decode".into()).spawn(move || {
+            for (key, wave, bytes) in rx {
+                let pcm = decode_wave(&wave, &bytes);
+                finished.lock().unwrap_or_else(|p| p.into_inner()).push((key, pcm));
+            }
+        });
+        Self { tx, done, pending: Default::default() }
+    }
+
+    /// Ask for `key`'s wave once (a wave already on its way isn't sent again).
+    fn submit(&mut self, key: WaveKey, wave: lma_data::xact::Wave, bytes: Vec<u8>) {
+        if self.pending.insert(key) {
+            let _ = self.tx.send((key, wave, bytes));
+        }
+    }
+
+    /// The waves finished since the last call.
+    fn take(&mut self) -> Vec<(WaveKey, Option<Pcm>)> {
+        let done = std::mem::take(&mut *self.done.lock().unwrap_or_else(|p| p.into_inner()));
+        for (key, _) in &done {
+            self.pending.remove(key);
+        }
+        done
+    }
+}
+
+/// The engine's mixer, shared with the output device's thread.
+pub type SharedMixer = std::sync::Arc<std::sync::Mutex<Mixer>>;
+
+/// `mixer` locked (a poisoned lock taken over); a function of the field alone, so the engine can
+/// lock it while it holds one of its instances mutably.
+fn lock_mixer(mixer: &SharedMixer) -> std::sync::MutexGuard<'_, Mixer> {
+    mixer.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 impl Engine {
+    /// The mixer, locked for one change or mix; a panic elsewhere while holding it doesn't silence the
+    /// sound (the poisoned lock is taken over).
+    pub fn mixer(&self) -> std::sync::MutexGuard<'_, Mixer> {
+        lock_mixer(&self.mixer)
+    }
+
     /// An engine with the game's global settings (categories, variables, curves), when loaded.
     pub fn new(settings: Option<lma_data::xact::GlobalSettings>, cache_bytes: usize) -> Self {
         let globals = settings.as_ref().map_or(Vec::new(), |g| g.variables.iter().map(|v| v.initial).collect());
-        Self { settings, waves: Vec::new(), sounds: Vec::new(), instances: Default::default(), next: 0, globals, cache: WaveCache::new(cache_bytes), mixer: Mixer::default(), cache_dir: None, cache_reads: 0, live_decodes: 0 }
+        Self { settings, waves: Vec::new(), sounds: Vec::new(), instances: Default::default(), next: 0, globals, cache: WaveCache::new(cache_bytes), mixer: SharedMixer::default(), cache_dir: None, cache_reads: 0, live_decodes: 0, decoder: None }
     }
 
     /// A wave bank from its file bytes; its index.
@@ -435,11 +498,29 @@ impl Engine {
         self.sounds.get(sb)?.cue(name)
     }
 
+    /// `<bank>/<cue>` for cue `cue` of sound bank `sb` (the black box's event log names sounds).
+    pub fn cue_label(&self, sb: usize, cue: usize) -> Option<String> {
+        let bank = self.sounds.get(sb)?;
+        Some(format!("{}/{}", bank.name, bank.cues.get(cue)?.name))
+    }
+
+    /// Move the background decoder's finished waves into the cache.
+    fn collect_decoded(&mut self) {
+        let Some(d) = self.decoder.as_mut() else { return };
+        for ((bank, wave), pcm) in d.take() {
+            if let Some(pcm) = pcm {
+                self.live_decodes += 1;
+                let _ = self.cache.get(bank, wave, || Some(pcm));
+            }
+        }
+    }
+
     /// Prepare cue `cue` of sound bank `sb`: its wave decoded (once, through the cache). Returns
     /// the instance's handle; None for a cue that doesn't exist. A cue whose wave can't be
     /// decoded (or a looping bed, whose clip events aren't read yet) is still a handle and plays
     /// silence, so the game's waits on it end.
     pub fn prepare(&mut self, sb: usize, cue: usize) -> Option<u64> {
+        self.collect_decoded();
         let bank = self.sounds.get(sb)?;
         let c = bank.cues.get(cue)?;
         let sound = &bank.sounds[c.sound];
@@ -448,14 +529,20 @@ impl Engine {
             let wb = self.waves.iter().position(|l| l.name.eq_ignore_ascii_case(name))?;
             let l = &self.waves[wb];
             let (wave, bytes) = (l.bank.waves.get(w as usize)?.clone(), l.bytes.clone());
-            let (reads, decodes) = (&mut self.cache_reads, &mut self.live_decodes);
+            let (reads, decodes, decoder) = (&mut self.cache_reads, &mut self.live_decodes, &mut self.decoder);
             self.cache.get(wb as u32, w as u32, || {
                 if let Some(p) = l.cached.as_ref().and_then(|c| c.wave(w as usize)) {
                     *reads += 1;
                     return Some(p);
                 }
+                let raw = l.bank.wave_bytes(&bytes, w as usize)?;
+                if let Some(d) = decoder.as_mut() {
+                    // silent this time; the decode thread has it ready for the next play
+                    d.submit((wb as u32, w as u32), wave.clone(), raw.to_vec());
+                    return None;
+                }
                 *decodes += 1;
-                decode_wave(&wave, l.bank.wave_bytes(&bytes, w as usize)?)
+                decode_wave(&wave, raw)
             })
         });
         self.next += 1;
@@ -465,6 +552,9 @@ impl Engine {
 
     /// Start a prepared cue (with its sound's volume, pitch and category).
     pub fn play(&mut self, handle: u64) {
+        // the RPC gain first: the voice starts at it under one mixer lock, so the output device
+        // can't mix a buffer of it at the default gain in between (a click at the cue's start)
+        let g = self.rpc_gain(handle);
         let Some(i) = self.instances.get_mut(&handle) else { return };
         if i.voice.is_some() || i.stopped {
             return;
@@ -473,14 +563,17 @@ impl Engine {
         let (volume, pitch, category) = (sound.volume, sound.pitch, sound.category);
         let loop_frames = sound.looping.then_some((0, 0));
         let voice = match &i.pcm {
-            Some(pcm) => self.mixer.play(pcm.clone(), volume, pitch, category, loop_frames),
+            Some(pcm) => {
+                let mut mixer = lock_mixer(&self.mixer);
+                let voice = mixer.play(pcm.clone(), volume, pitch, category, loop_frames);
+                if voice != 0 {
+                    mixer.set_rpc_gain(voice, g);
+                }
+                voice
+            }
             None => 0,
         };
         i.voice = Some(voice);
-        if voice != 0 {
-            let g = self.rpc_gain(handle);
-            self.mixer.set_rpc_gain(voice, g);
-        }
     }
 
     /// The RPC volume of an instance's sound at the current global values (linear; 1.0 without
@@ -502,16 +595,24 @@ impl Engine {
     pub fn stop(&mut self, handle: u64) {
         if let Some(i) = self.instances.get_mut(&handle) {
             if let Some(v) = i.voice {
-                self.mixer.stop(v);
+                lock_mixer(&self.mixer).stop(v);
             }
             i.stopped = true;
+        }
+    }
+
+    /// Stop sound bank `sb`'s instances of `cue`, or all of them (XACT's SoundBank::Stop).
+    pub fn stop_cues(&mut self, sb: usize, cue: Option<usize>) {
+        let hs: Vec<u64> = self.instances.iter().filter(|(_, i)| i.sound_bank == sb && cue.is_none_or(|c| i.cue == c)).map(|(&h, _)| h).collect();
+        for h in hs {
+            self.stop(h);
         }
     }
 
     /// Pause (true) or resume (false) a playing instance (XACT's Cue::Pause).
     pub fn pause(&mut self, handle: u64, paused: bool) {
         if let Some(v) = self.instances.get(&handle).and_then(|i| i.voice) {
-            self.mixer.set_paused(v, paused);
+            lock_mixer(&self.mixer).set_paused(v, paused);
         }
     }
 
@@ -530,7 +631,7 @@ impl Engine {
         Some(match i.voice {
             _ if i.stopped => CueState::Stopped,
             None => CueState::Prepared,
-            Some(v) if v != 0 && self.mixer.playing(v) => CueState::Playing,
+            Some(v) if v != 0 && lock_mixer(&self.mixer).playing(v) => CueState::Playing,
             Some(_) => CueState::Stopped,
         })
     }
@@ -545,7 +646,7 @@ impl Engine {
     pub fn set_category_volume(&mut self, name: &str, gain: f32) -> bool {
         match self.settings.as_ref().and_then(|g| g.category(name)) {
             Some(i) => {
-                self.mixer.set_category_volume(i as u16, gain);
+                lock_mixer(&self.mixer).set_category_volume(i as u16, gain);
                 true
             }
             None => false,
@@ -567,7 +668,7 @@ impl Engine {
         let playing: Vec<(u64, u64)> = self.instances.iter().filter_map(|(&h, i)| i.voice.filter(|&v| v != 0).map(|v| (h, v))).collect();
         for (h, v) in playing {
             let g = self.rpc_gain(h);
-            self.mixer.set_rpc_gain(v, g);
+            lock_mixer(&self.mixer).set_rpc_gain(v, g);
         }
     }
 
@@ -761,7 +862,7 @@ pub(crate) mod tests {
         e.play(h);
         assert_eq!(e.state(h), Some(CueState::Playing));
         let mut out = vec![[0f32; 2]; 8];
-        e.mixer.mix(&mut out);
+        e.mixer().mix(&mut out);
         assert!((out[0][0] - 0.5 * volume_gain(180)).abs() < 1e-3 && out[5] == [0.0, 0.0], "{out:?}");
         assert_eq!(e.state(h), Some(CueState::Stopped), "a one-shot ends");
         let again = e.play_cue(sb, c).unwrap();
@@ -771,8 +872,31 @@ pub(crate) mod tests {
         let kick = e.play_cue(sb, e.cue_index(sb, "kick").unwrap()).unwrap();
         assert_eq!(e.state(kick), Some(CueState::Playing));
         e.release(kick);
-        assert_eq!((e.state(kick), e.mixer.voices()), (None, 0));
+        assert_eq!((e.state(kick), e.mixer().voices()), (None, 0));
         assert_eq!((e.cue_index(sb, "nope"), e.prepare(sb, 9), e.prepare(5, 0)), (None, None, None));
+    }
+
+    /// With the background decoder a wave missing from the caches is decoded off the calling thread:
+    /// the first cue plays silence, a later one has the wave; it's asked for once (#772).
+    #[test]
+    fn the_decoder_thread_decodes_a_missing_wave_for_the_next_play() {
+        let mut e = Engine::new(None, 1 << 20);
+        e.decoder = Some(Decoder::spawn());
+        let sb = e.load_sound_bank(&simple_sound_bank("MATCH", &[("BallNet", 0, 180, 4)])).unwrap();
+        e.load_wave_bank(pcm_wave_bank("MATCH", &[vec![16384; 4]])).unwrap();
+        let first = e.play_cue(sb, 0).unwrap();
+        assert_eq!(e.state(first), Some(CueState::Stopped), "no wave yet: silence, finished at once");
+        let _ = e.play_cue(sb, 0); // asked again while on its way: not sent twice
+        let t = std::time::Instant::now();
+        loop {
+            let h = e.play_cue(sb, 0).unwrap();
+            if e.state(h) == Some(CueState::Playing) {
+                break;
+            }
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "the decode thread never answered");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!((e.live_decodes, e.cache.decodes), (1, 1), "decoded once, by the thread");
     }
 
     /// Pause holds a voice silent where it is; the wave-bank queries native audio loads by.
@@ -786,11 +910,26 @@ pub(crate) mod tests {
         let h = e.play_cue(sb, 0).unwrap();
         e.pause(h, true);
         let mut out = vec![[0f32; 2]; 4];
-        e.mixer.mix(&mut out);
+        e.mixer().mix(&mut out);
         assert_eq!((out[0], e.state(h)), ([0.0, 0.0], Some(CueState::Playing)), "paused: silent, not finished");
         e.pause(h, false);
-        e.mixer.mix(&mut out);
+        e.mixer().mix(&mut out);
         assert!(out[0][0] > 0.0, "resumed from where it was");
+    }
+
+    /// SoundBank::Stop ends one cue's instances or, with no cue, all of the bank's.
+    #[test]
+    fn a_sound_bank_stops_its_cues() {
+        let mut e = Engine::new(None, 1 << 20);
+        let sb = e.load_sound_bank(&simple_sound_bank("MENU", &[("music", 0, 180, 0), ("click", 0, 180, 0)])).unwrap();
+        e.load_wave_bank(pcm_wave_bank("MENU", &[vec![16384; 64]])).unwrap();
+        let (music, click) = (e.play_cue(sb, 0).unwrap(), e.play_cue(sb, 1).unwrap());
+        e.stop_cues(sb, Some(0));
+        assert_eq!((e.state(music), e.state(click)), (Some(CueState::Stopped), Some(CueState::Playing)));
+        e.stop_cues(sb + 1, None);
+        assert_eq!(e.state(click), Some(CueState::Playing), "another bank's stop");
+        e.stop_cues(sb, None);
+        assert_eq!(e.state(click), Some(CueState::Stopped));
     }
 
     /// Category 0 (Global) scales every category; the others only their own.
@@ -805,6 +944,21 @@ pub(crate) mod tests {
         let mut out = vec![[0f32; 2]; 1];
         m.mix(&mut out);
         assert!((out[0][0] - 0.125 * volume_gain(180)).abs() < 1e-4, "{out:?}");
+    }
+
+    /// The output device's copy of the mixer hears what the engine plays, and mixes while the
+    /// engine itself is locked by the game thread (#772: a decode under that lock stalled the device).
+    #[test]
+    fn the_device_mixes_without_the_engine_lock() {
+        let pcm = std::sync::Arc::new(Pcm { channels: 1, rate: OUT_RATE, samples: vec![16384; 4] });
+        let e = Engine::new(None, 1 << 20);
+        let device = e.mixer.clone();
+        e.mixer().play(pcm, 180, 0, 0, None);
+        let engine = std::sync::Mutex::new(e);
+        let _held = engine.lock().unwrap(); // the game thread in a hook
+        let mut out = vec![[0f32; 2]; 1];
+        device.lock().unwrap().mix(&mut out);
+        assert!((out[0][0] - 0.5 * volume_gain(180)).abs() < 1e-4, "{out:?}");
     }
 
     /// The decoder model's memory: a read past it is zeros and a write past it is dropped, not a panic.

@@ -12,18 +12,23 @@
 //! The intro runs in turbo until LMA_TURBO_UNTIL million instructions (default 4700, just
 //! before the title screen; 0 disables). LMA_LOAD=<state> starts from a save state.
 //! LMA_INPUT and LMA_INPUT_LIVE=1 script the controller from the environment or stdin, with
-//! save/load/screenshot commands (see `script.rs`). LMA_RECORD=<path> records your own presses
+//! save/load/screenshot/report commands (see `script.rs`). LMA_RECORD=<path> records your own presses
 //! for replay (`LMA_LOAD=<path>.state LMA_INPUT=@<path>`).
 //!
 //! Pixels are drawn on the GPU (wgpu: Vulkan, Metal or DX12). `--software` or LMA_BACKEND=software
 //! uses the CPU rasteriser instead, which is also the automatic fallback when no GPU adapter is found.
 
 mod audio_out;
+mod blackbox;
+mod bundle;
 mod config;
 mod device;
+mod install;
 mod keys;
 mod launcher;
 mod menu_sound;
+mod power;
+mod prepare;
 mod script;
 
 use bevy::asset::RenderAssetUsages;
@@ -101,35 +106,96 @@ struct Shared {
     /// The settings menu (F2): a frame cap to switch to, and the cap in force (for the menu).
     cap_set: Option<u32>,
     cap: u32,
+    /// F2's Battery saver, changed.
+    battery_set: Option<config::BatterySaver>,
 }
 
-/// The app icon (#766): our own badge (tools/gen_icon.py, lma-rs/assets/icon), set on the window
-/// once winit has created it. Bevy has no icon setting; winit's windows live in a main-thread
-/// thread-local, hence the NonSendMarker. Windows and Linux show it (title bar, taskbar); macOS
-/// takes the dock icon from the app bundle instead.
+/// The app icon: LMA's own (the maintainer, 26 Oct: "the icon from LMA, don't generate one"), the title
+/// icon in the player's default.xex (`xex::Xex::title_icon_png`), read at run time so nothing of
+/// the game ships; none of our own (the maintainer, 28 Oct: "remove the AI icon, just use the game file
+/// one"), so before a game is set up the system's default. Set on the window
+/// once winit has created it (Windows and Linux: title bar, taskbar) and, on macOS, as the Dock
+/// icon. Bevy has no icon setting; winit's windows live in a main-thread thread-local, hence the
+/// NonSendMarker.
 fn set_window_icon(windows: Query<Entity, With<bevy::window::PrimaryWindow>>, mut done: Local<bool>, _main_thread: bevy::ecs::system::NonSendMarker) {
     if *done {
         return;
     }
     let Ok(entity) = windows.single() else { return };
+    *done = true;
+    let Some(game) = game_xex().and_then(|p| std::fs::read(p).ok()).and_then(|d| xex::Xex::parse(&d).ok()).and_then(|x| x.title_icon_png().map(<[u8]>::to_vec)) else { return };
+    let png = game.as_slice();
+    #[cfg(target_os = "macos")]
+    set_dock_icon(png);
+    let Some((rgba, w, h)) = png_rgba(png) else {
+        warn!("window icon: can't decode it");
+        return;
+    };
     bevy::winit::WINIT_WINDOWS.with_borrow(|ws| {
         let Some(window) = ws.get_window(entity) else { return };
-        *done = true;
-        const PNG: &[u8] = include_bytes!("../../../assets/icon/icon_256.png");
-        let decoder = png::Decoder::new(std::io::Cursor::new(PNG));
-        let Ok(mut reader) = decoder.read_info() else { return };
-        let mut buf = vec![0; reader.output_buffer_size()];
-        let Ok(info) = reader.next_frame(&mut buf) else { return };
-        if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
-            warn!("window icon: want 8-bit RGBA, got {:?} {:?}", info.color_type, info.bit_depth);
-            return;
-        }
-        buf.truncate(info.buffer_size());
-        match winit::window::Icon::from_rgba(buf, info.width, info.height) {
+        match winit::window::Icon::from_rgba(rgba, w, h) {
             Ok(icon) => window.set_window_icon(Some(icon)),
             Err(e) => warn!("window icon: {e}"),
         }
     });
+}
+
+/// The game's default.xex: a `.xex` given as the argument, else the configured game folder's.
+fn game_xex() -> Option<std::path::PathBuf> {
+    if let Some(a) = std::env::args().skip(1).find(|a| a.to_ascii_lowercase().ends_with(".xex")) {
+        return Some(a.into());
+    }
+    config::Config::load().game_dir.map(|d| d.join("default.xex")).filter(|p| p.is_file())
+}
+
+/// A PNG as 8-bit RGBA (RGB, grey and palette images expanded; an opaque alpha added).
+fn png_rgba(png: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    let (w, h) = (info.width, info.height);
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::Indexed => return None,
+    };
+    Some((rgba, w, h))
+}
+
+/// macOS: the Dock icon from PNG bytes (the bundle's own icon shows until this runs).
+#[cfg(target_os = "macos")]
+fn set_dock_icon(png: &[u8]) {
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let data = NSData::with_bytes(png);
+    let Some(image) = NSImage::initWithData(mtm.alloc(), &data) else { return };
+    // SAFETY: on the main thread (the marker), with a valid image
+    unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+}
+
+/// The window can't be seen (minimised, fully covered, on another Space): the game keeps running
+/// and sounding but draws nothing (the maintainer, 26 Oct, battery: drawing is ~65% of a match's CPU on the
+/// M4, 1.76 -> 0.62 cores; a menu 0.37 -> 0.27). Set from winit's occlusion events.
+static WINDOW_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Also slows Bevy's own loop while hidden: nothing is shown, and without vsync pacing a hidden
+/// window's continuous loop runs flat out. Four updates a second still see it come back.
+fn follow_occlusion(mut occluded: MessageReader<bevy::window::WindowOccluded>, mut winit: ResMut<bevy::winit::WinitSettings>) {
+    for e in occluded.read() {
+        WINDOW_HIDDEN.store(e.occluded, std::sync::atomic::Ordering::Relaxed);
+        *winit = if e.occluded {
+            let slow = bevy::winit::UpdateMode::reactive_low_power(std::time::Duration::from_millis(250));
+            bevy::winit::WinitSettings { focused_mode: slow, unfocused_mode: slow }
+        } else {
+            bevy::winit::WinitSettings::game()
+        };
+    }
 }
 
 /// The in-window settings menu (F2): which item is selected, and the player's settings it changes
@@ -146,6 +212,9 @@ struct Menu {
     /// The game's sound level, 0-100, in steps of 10.
     volume: u8,
     coop: Coop,
+    battery: config::BatterySaver,
+    /// Render scale for the next start (1 = 1280x720); this run keeps the one it started with.
+    scale: u32,
     /// Just closed: the Enter/Esc that closed it must not reach the game as A/B (`read_input`)
     /// while it is still held.
     just_closed: bool,
@@ -153,7 +222,7 @@ struct Menu {
 
 impl Default for Menu {
     fn default() -> Self {
-        Menu { open: false, sel: 0, status_line: false, vsync: true, fullscreen: false, size: 0, volume: 100, coop: Coop::Off, just_closed: false }
+        Menu { open: false, sel: 0, status_line: false, vsync: true, fullscreen: false, size: 0, volume: 100, coop: Coop::Off, battery: config::BatterySaver::OnBattery, scale: 1, just_closed: false }
     }
 }
 
@@ -161,16 +230,18 @@ impl Default for Menu {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum MenuItem {
     FrameCap,
+    Battery,
     VSync,
     Window,
     WindowSize,
+    RenderScale,
     Volume,
     Coop,
     StatusLine,
     Close,
 }
 
-const MENU_ITEMS: [MenuItem; 8] = [MenuItem::FrameCap, MenuItem::VSync, MenuItem::Window, MenuItem::WindowSize, MenuItem::Volume, MenuItem::Coop, MenuItem::StatusLine, MenuItem::Close];
+const MENU_ITEMS: [MenuItem; 10] = [MenuItem::FrameCap, MenuItem::Battery, MenuItem::VSync, MenuItem::Window, MenuItem::WindowSize, MenuItem::RenderScale, MenuItem::Volume, MenuItem::Coop, MenuItem::StatusLine, MenuItem::Close];
 
 /// Co-op controls (the maintainer, 22 Oct: "play co-op with one controller, or keyboard and controller").
 /// The game's two-player career takes turns (each manager plays his own days), so one pad can be
@@ -249,15 +320,21 @@ impl Menu {
     fn from_config(cfg: &config::Config) -> Self {
         let size = config::WINDOW_SIZES.iter().position(|&s| s == cfg.window_size()).unwrap_or(0);
         audio_out::VOLUME.store(cfg.volume() as u32, std::sync::atomic::Ordering::Relaxed);
-        Menu { status_line: cfg.status_line_shown(), vsync: cfg.vsync(), fullscreen: cfg.fullscreen, size, volume: cfg.volume(), coop: Coop::from_config(cfg.coop.as_deref()), ..Menu::default() }
+        Menu { status_line: cfg.status_line_shown(), vsync: cfg.vsync(), fullscreen: cfg.fullscreen, size, volume: cfg.volume(), coop: Coop::from_config(cfg.coop.as_deref()), battery: cfg.battery_saver(), scale: cfg.render_scale(), ..Menu::default() }
     }
 
     /// Change `item` by `step` (-1 / +1; Enter is +1). Returns whether a setting changed.
     fn change(&mut self, item: MenuItem, step: i32) -> bool {
         match item {
+            MenuItem::Battery => {
+                let all = config::BatterySaver::ALL;
+                let i = all.iter().position(|&b| b == self.battery).unwrap_or(1) as i32;
+                self.battery = all[(i + step).rem_euclid(all.len() as i32) as usize];
+            }
             MenuItem::VSync => self.vsync = !self.vsync,
             MenuItem::Window => self.fullscreen = !self.fullscreen,
             MenuItem::WindowSize => self.size = (self.size as i32 + step).rem_euclid(config::WINDOW_SIZES.len() as i32) as usize,
+            MenuItem::RenderScale => self.scale = (self.scale as i32 - 1 + step).rem_euclid(config::RENDER_SCALE_MAX as i32) as u32 + 1,
             MenuItem::Volume => self.volume = (self.volume as i32 + 10 * step).clamp(0, 100) as u8,
             MenuItem::Coop => {
                 let i = Coop::ALL.iter().position(|c| *c == self.coop).unwrap_or(0) as i32;
@@ -278,6 +355,8 @@ impl Menu {
         c.window_size = Some(config::WINDOW_SIZES[self.size]);
         c.volume = Some(self.volume);
         c.coop = self.coop.config();
+        c.battery_saver = Some(self.battery);
+        c.render_scale = Some(self.scale);
         if let Err(e) = c.save() {
             warn!("could not save the settings: {e}");
         }
@@ -289,14 +368,19 @@ impl Menu {
         let onoff = |b: bool| if b { "on" } else { "off" };
         let [w, h] = config::WINDOW_SIZES[self.size];
         format!(
-            "Settings (F2)\n\n{}Frame cap      < {} >\n{}VSync          < {} >\n{}Window         < {} >\n{}Window size    < {w} x {h} >\n{}Volume         < {}% >\n{}Co-op          < {} >\n{}Status line    < {} >\n{}Close\n\nUp/Down select, Left/Right change, Enter/Esc close",
+            "Settings (F2)\n\n{}Frame cap      < {} >\n{}Battery saver  < {} >\n{}VSync          < {} >\n{}Window         < {} >\n{}Window size    < {w} x {h} >\n{}Render scale   < {} >{}\n{}Volume         < {}% >\n{}Co-op          < {} >\n{}Status line    < {} >\n{}Close\n\nUp/Down select, Left/Right change, Enter/Esc close",
             mark(MenuItem::FrameCap),
             cap_label(cap),
+            mark(MenuItem::Battery),
+            self.battery.label(),
             mark(MenuItem::VSync),
             onoff(self.vsync),
             mark(MenuItem::Window),
             if self.fullscreen { "fullscreen" } else { "windowed" },
             mark(MenuItem::WindowSize),
+            mark(MenuItem::RenderScale),
+            format!("{}x ({}p)", self.scale, 720 * self.scale),
+            if self.scale == runtime::gpu_wgpu::res_scale() { "" } else { "  (on next start)" },
             mark(MenuItem::Volume),
             self.volume,
             mark(MenuItem::Coop),
@@ -364,9 +448,12 @@ struct StatusText;
 /// meaning what it did), up to 4 game threads (one core left for the rest on a small laptop),
 /// resolve reuse off. A variable already set wins, so scripts and the settings keep control.
 fn release_defaults() {
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
-        if std::env::args_os().len() == 1 && dir.join("mods").is_dir() {
-            let _ = std::env::set_current_dir(&dir);
+    // inside LMA.app (macOS): the config folder, with a link to the bundle's mods (bundle.rs)
+    if !bundle::enter() {
+        if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+            if std::env::args_os().len() == 1 && dir.join("mods").is_dir() {
+                let _ = std::env::set_current_dir(&dir);
+            }
         }
     }
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1)).clamp(1, 4).to_string();
@@ -379,12 +466,26 @@ fn release_defaults() {
 
 fn main() {
     release_defaults();
+    install::use_audio_cache();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mod_id = runtime::mods::selected(&mut args);
     let software = take_flag(&mut args, "--software") || std::env::var("LMA_BACKEND").as_deref() == Ok("software");
     // the game folder: an argument (remembered for next time), else the remembered one (#4)
     let show_launcher = launcher::wanted(!args.is_empty());
+    // the downloaded app (no game code in it): once the game is built for this computer, every
+    // start goes straight to it (prepare.rs)
+    if prepare::is_shell() {
+        if let Some(exe) = prepare::built_game() {
+            let e = prepare::handover(&exe);
+            eprintln!("lma-app: couldn't start the built game {}: {e}", exe.display());
+        }
+    }
     let cfg = config::Config::load();
+    // F2's render scale, read once by the backend (`runtime::gpu_wgpu::res_scale`) before any
+    // surface exists; set before other threads start
+    if std::env::var_os("LMA_RES_SCALE").is_none() && cfg.render_scale() > 1 {
+        unsafe { std::env::set_var("LMA_RES_SCALE", cfg.render_scale().to_string()) };
+    }
     let (map, ignored) = keys::map(&cfg.keys);
     for i in &ignored {
         eprintln!("lma: [keys] in the config: {i} (ignored)");
@@ -400,30 +501,35 @@ fn main() {
     let link = Link(Arc::new(Mutex::new(Shared::default())));
     // the quick save of builds before versions had their own folders belongs to the version played
     // last, not to the original game (#673): moved there once
-    if let Some(note) = launcher::adopt_old_quick_state(std::path::Path::new("states"), cfg.mod_space.as_deref()) {
+    if let Some(note) = launcher::adopt_old_quick_state(std::path::Path::new("states"), launcher::mod_space_of(cfg.mod_space.as_deref())) {
         eprintln!("lma-app: {note}");
     }
+    let prepare_state = prepare::Prepare::default();
     // the launcher picks how to start (continue, boot, a save state); scripts start at once
     let launcher = if show_launcher {
-        let note = if std::path::Path::new(&xex_path).exists() {
-            String::new()
-        } else {
-            format!("Game not found at {xex_path}.\nRun lma-app once with the path to your default.xex;\nit is remembered from then on.")
-        };
+        let installed = std::path::Path::new(&xex_path).exists();
+        // the game is installed but this downloaded app hasn't built it yet: carry on with that
+        // (the launcher shows its progress instead of the versions)
+        if installed && prepare::is_shell() {
+            prepare::start(&prepare_state, std::path::PathBuf::from(&xex_path));
+        }
+        let needs_game = !installed || prepare::is_shell();
+        // the first run: the launcher asks for the player's disc (install.rs)
+        let note = if needs_game { install::note(&install::State::Idle) } else { String::new() };
         let mods = launcher::mod_spaces(std::path::Path::new("mods"));
         // the last version chosen, unless --mod / LMA_MOD says otherwise (and it still exists)
-        let mod_id = mod_id.or(cfg.mod_space.clone()).filter(|id| mods.iter().any(|(m, _)| m == id));
+        let mod_id = mod_id.or(cfg.mod_space.clone()).filter(|id| id == launcher::PLUS || mods.iter().any(|(m, _)| m == id));
         // the versions: mods/menu.txt's rows, else every mod space (newest first) and the original
         // game; the ways to start follow the chosen one (launcher::Launcher::rebuild)
         let versions = if note.is_empty() { launcher::versions(std::path::Path::new("mods"), &mods) } else { Vec::new() };
-        let mut l = launcher::Launcher { versions, items: Vec::new(), sel: 0, pending: Some(launcher::Pending { xex: xex_path, mod_id, software }), note, fullscreen: cfg.fullscreen, states_root: "states".into() };
+        let mut l = launcher::Launcher { versions, items: Vec::new(), sel: 0, pending: Some(launcher::Pending { xex: xex_path, mod_id, software }), note, fullscreen: cfg.fullscreen, states_root: "states".into(), needs_game };
         if l.note.is_empty() {
             l.rebuild();
         }
         l
     } else {
         spawn_game(xex_path, mod_id, software, link.clone(), None);
-        launcher::Launcher { versions: Vec::new(), items: Vec::new(), sel: 0, pending: None, note: String::new(), fullscreen: cfg.fullscreen, states_root: "states".into() }
+        launcher::Launcher { versions: Vec::new(), items: Vec::new(), sel: 0, pending: None, note: String::new(), fullscreen: cfg.fullscreen, states_root: "states".into(), needs_game: false }
     };
 
     // pipelines of earlier sessions are built at start (#304), listed next to the config file;
@@ -484,15 +590,18 @@ fn main() {
         .insert_resource(bevy::render::error_handler::RenderErrorHandler(on_render_error))
         .insert_resource(link)
         .insert_resource(launcher)
+        .init_resource::<launcher::Face>()
         .init_resource::<menu_sound::MenuSounds>()
         .init_non_send::<menu_sound::MenuStream>()
         .insert_resource(key_map)
         .add_systems(Startup, setup)
-        .add_systems(Update, set_window_icon)
+        .add_systems(Update, (set_window_icon, follow_occlusion))
         .insert_resource(Menu::from_config(&cfg))
         .init_resource::<Turn>()
         .insert_resource(device::InputKind::default())
-        .add_systems(Update, (device::track, device::glyphs, launcher::input, menu_sound::follow, launcher::show, menu_input, read_input, show_frame).chain())
+        .insert_resource(install::Install::default())
+        .insert_resource(prepare_state)
+        .add_systems(Update, (install::on_drop, install::browse, install::follow, prepare::follow, device::track, device::glyphs, launcher::input, menu_sound::follow, launcher::show, menu_input, read_input, show_frame).chain())
         .add_systems(Update, (launcher::shot, window_shot));
     // LMA_LOSE_DEVICE=<frames> (#302, testing): destroy the window's GPU device every that many
     // frames, as a driver reset would
@@ -707,6 +816,15 @@ fn spawn_game(xex_path: String, mod_id: Option<String>, software: bool, link: Li
         // guest frame rate over the last 2 s: average and 1% low (99th-percentile frame time)
         let (mut fps_text, mut last_fps) = (String::from("- fps"), 0u64);
         let mut cap = load_cap(&userdata);
+        // the battery saver (F2, and the 30 cap): every 2nd guest frame drawn and shown while it is
+        // on, the power source checked every 5 s; never in deterministic runs, replays or with a
+        // fixed frame skip (LMA_RENDER_EVERY, the config's render_every). While it is on the adaptive
+        // skip is off: a machine that would need 1 in 3 stays at 1 in 2 (the default allows no skip).
+        let mut saver = settings.battery_saver();
+        let mut saving = false;
+        // saving because of the battery (not the 30 cap): the note follows only this
+        let mut saving_battery = false;
+        let mut power_checked: Option<std::time::Instant> = None;
         let mut render_last = (0u64, 0u64);
         // LMA_FRAME_PROFILE=1: both threads' time per guest frame in the log every 2 s (#6)
         runtime::prof::ON.store(std::env::var("LMA_FRAME_PROFILE").as_deref() == Ok("1"), std::sync::atomic::Ordering::Relaxed);
@@ -716,17 +834,28 @@ fn spawn_game(xex_path: String, mod_id: Option<String>, software: bool, link: Li
         let mut held = None;
         // LMA_FRAME_DIR=<dir> (#205): every presented frame as a small PNG, to find one-frame flashes
         let frame_dump = std::env::var_os("LMA_FRAME_DIR").map(|d| script::FrameDump::start(d.into()));
+        // the black box (LMA_BLACKBOX=<min>, 0 = off): the last minutes kept for a bug report
+        let mut blackbox = if replay.is_none() { blackbox::BlackBox::from_env() } else { None };
         let mut shown_times: Vec<std::time::Instant> = Vec::new(); // frames handed to the window
         loop {
-            let (save, load, toggle, cycle, cap_set, report) = {
+            let (save, load, toggle, cycle, cap_set, report, battery_set) = {
                 let mut sh = link.0.lock().unwrap();
                 sh.cap = cap;
-                (std::mem::take(&mut sh.save), std::mem::take(&mut sh.load), std::mem::take(&mut sh.turbo_toggle), std::mem::take(&mut sh.cap_cycle), sh.cap_set.take(), std::mem::take(&mut sh.report))
+                (std::mem::take(&mut sh.save), std::mem::take(&mut sh.load), std::mem::take(&mut sh.turbo_toggle), std::mem::take(&mut sh.cap_cycle), sh.cap_set.take(), std::mem::take(&mut sh.report), sh.battery_set.take())
             };
-            if report {
-                match bug_report(&mut m, &report_mod, &fps_text) {
+            // the black box: a sound started over and over writes a report by itself (once a session)
+            let auto = if blackbox.is_some() { runtime::events::take_repeat() } else { None };
+            if let Some(why) = &auto {
+                warn!("black box: {why}");
+            }
+            if report || auto.is_some() {
+                match bug_report(&mut m, &report_mod, &fps_text, blackbox.as_mut(), auto.as_deref()) {
                     Ok(dir) => {
-                        note = format!("bug report saved: {}", dir.display());
+                        note = match &auto {
+                            Some(why) => format!("{why}: bug report saved: {}", dir.display()),
+                            None => format!("bug report saved: {}", dir.display()),
+                        };
+                        info!("{note}");
                         shot = Some(("bug report".into(), dir.join("screen.png")));
                     }
                     Err(e) => note = format!("bug report failed: {e}"),
@@ -737,12 +866,36 @@ fn spawn_game(xex_path: String, mod_id: Option<String>, software: bool, link: Li
                 (true, _) => Some(CAPS[(CAPS.iter().position(|&c| c == cap).unwrap_or(1) + 1) % CAPS.len()]),
                 _ => None,
             };
+            if let Some(b) = battery_set {
+                saver = b;
+                power_checked = None;
+            }
             if let Some(c) = new_cap {
                 cap = c;
+                power_checked = None;
                 note = match save_cap(&userdata, cap) {
                     Ok(()) => format!("frame {}", cap_label(cap)),
                     Err(e) => format!("frame {} (not saved: {e})", cap_label(cap)),
                 };
+            }
+            if power_checked.is_none_or(|t| t.elapsed().as_secs() >= 5) {
+                power_checked = Some(std::time::Instant::now());
+                let battery = saver.active(saver == config::BatterySaver::OnBattery && power::on_battery());
+                let want = fixed.is_none() && !m.deterministic && replay.is_none() && (battery || cap == 30);
+                if want != saving {
+                    saving = want;
+                    let e = if saving { 2 } else { every };
+                    m.gpu.render_every = e;
+                    m.gpu.present_every = e;
+                    m.adaptive_skip = !saving && fixed.is_none() && !m.deterministic;
+                    if let Some(j) = m.journal.as_mut().filter(|j| !j.is_replay()) {
+                        j.record_skip(m.clock, e);
+                    }
+                }
+                if (want && battery) != saving_battery {
+                    saving_battery = want && battery;
+                    note = if saving_battery { "battery saver: 30 frames a second (F2)" } else { "battery saver off" }.into();
+                }
             }
             if toggle {
                 turbo = !turbo;
@@ -784,6 +937,11 @@ fn spawn_game(xex_path: String, mod_id: Option<String>, software: bool, link: Li
                     script::Cmd::Status => {
                         println!("lma: {}", link.0.lock().unwrap().status);
                         continue;
+                    }
+                    // written at the top of the next turn, as F12
+                    script::Cmd::Report => {
+                        link.0.lock().unwrap().report = true;
+                        Ok(String::new())
                     }
                     script::Cmd::Quit => {
                         // LMA_KERNEL_LOG=<path>: the kernel call log, as lma-cli's last_run.log
@@ -827,8 +985,11 @@ fn spawn_game(xex_path: String, mod_id: Option<String>, software: bool, link: Li
                     Err(e) => script::error(&line, e),
                 }
             }
-            m.gpu.render = !turbo;
-            m.gpu.present_all = !turbo; // nothing is drawn in turbo: skip the costly front buffer reads
+            // nothing is drawn in turbo, or while the window can't be seen (the game and its sound run
+            // on); skip the costly front buffer reads too
+            let draw = !turbo && !WINDOW_HIDDEN.load(std::sync::atomic::Ordering::Relaxed);
+            m.gpu.render = draw;
+            m.gpu.present_all = draw;
             let (pad, others) = {
                 let mut sh = link.0.lock().unwrap();
                 let mut pad = sh.pad;
@@ -837,6 +998,9 @@ fn spawn_game(xex_path: String, mod_id: Option<String>, software: bool, link: Li
             };
             if let Some(r) = recorder.as_mut() {
                 r.update(m.now(), pad.buttons);
+            }
+            if let Some(b) = blackbox.as_mut() {
+                b.tick(&mut m, pad.buttons);
             }
             let scripted = driver.buttons(m.now());
             // ports 2-4: the extra gamepads, plus the live script after `port N` (a port opened
@@ -990,7 +1154,7 @@ fn spawn_game(xex_path: String, mod_id: Option<String>, software: bool, link: Li
                     m.gpu.stats.frames,
                     m.gpu.stats.draws,
                     backend,
-                    if turbo { " | TURBO (not drawing)" } else { "" },
+                    if turbo { " | TURBO (not drawing)" } else if WINDOW_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) { " | window hidden (not drawing)" } else { "" },
                     note
                 );
                 // the status line also goes to the log every 5 s, for timing runs without a screen
@@ -1053,8 +1217,10 @@ fn on_render_error(error: &bevy::render::error_handler::RenderError, _: &mut Wor
 /// A bug report (F12 / Ctrl+B, the maintainer 22 Oct): `reports/<date>-<time>/` beside the game with the
 /// state at that moment (loads with F9-style `LMA_LOAD`), a screenshot (written with the next
 /// frame) and report.txt (version, mod, system, game clock, fps). Nothing leaves the PC: the player
-/// sends the folder. The state holds game memory, so it never goes on a GitHub issue.
-fn bug_report(m: &mut runtime::machine::Machine, mod_label: &str, fps: &str) -> Result<std::path::PathBuf, String> {
+/// sends the folder. The state holds game memory, so it never goes on a GitHub issue. With the black
+/// box on it also holds the minutes before (`before.state` + `before.input`), events.txt (every
+/// sound started, repeats flagged) and, for a report the app wrote by itself, why.
+fn bug_report(m: &mut runtime::machine::Machine, mod_label: &str, fps: &str, blackbox: Option<&mut blackbox::BlackBox>, auto: Option<&str>) -> Result<std::path::PathBuf, String> {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // civil date from days since 1970 (UTC), as the state and log names use no local clock
@@ -1067,12 +1233,26 @@ fn bug_report(m: &mut runtime::machine::Machine, mod_label: &str, fps: &str) -> 
     let y = yoe + era * 400 + i64::from(mo <= 2);
     let dir = std::path::PathBuf::from("reports").join(format!("{y:04}{mo:02}{d:02}-{:02}{:02}{:02}", rem / 3600, rem / 60 % 60, rem % 60));
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let state = save_state(m, &dir.join("game.state"))?;
+    // in the background as the black box's (a full save stalled the game ~4 s, 29 Oct); the
+    // thread finishes in ~2 s, so a report made just before quitting can lack game.state
+    let path = dir.join("game.state");
+    drop(m.save_state_background(path.clone()));
+    if let Some(j) = m.journal.as_mut() {
+        j.record_end(m.clock);
+    }
+    let state = format!("{} (written in the background)", path.display());
+    let before = blackbox.map(|b| b.add_to_report(&dir)).unwrap_or_default();
+    std::fs::write(dir.join("events.txt"), runtime::events::dump()).map_err(|e| format!("events.txt: {e}"))?;
+    let what = match auto {
+        Some(why) => format!("written by the app itself: {why}"),
+        None => "(write it here)".into(),
+    };
     let report = format!(
         "LMA Manager 2007 native port, bug report\n\
-         What happened (write it here):\n\n\n\
-         version: lma-app {}\nversion played: {mod_label}\nsystem: {} {}\ngame clock: {} M instructions\nfps: {fps}\nstate: {state}\n",
+         What happened: {what}\n\n\n\
+         version: lma-app {} (build {})\nversion played: {mod_label}\nsystem: {} {}\ngame clock: {} M instructions\nfps: {fps}\nstate: {state}\n{before}",
         env!("CARGO_PKG_VERSION"),
+        runtime::BUILD,
         std::env::consts::OS,
         std::env::consts::ARCH,
         m.clock / 1_000_000,
@@ -1126,7 +1306,8 @@ fn load_state(m: &mut runtime::machine::Machine, path: &std::path::Path) -> Resu
 
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let image = Image::new_fill(
-        Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        // at LMA_RES_SCALE the picture has more pixels; the sprite keeps the game's 16:9 size
+        Extent3d { width: W * runtime::gpu_wgpu::res_scale(), height: H * runtime::gpu_wgpu::res_scale(), depth_or_array_layers: 1 },
         TextureDimension::D2,
         &[0, 0, 0, 255],
         TextureFormat::Rgba8UnormSrgb,
@@ -1167,6 +1348,8 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
                 Visibility::Hidden,
                 launcher::LauncherText,
             ));
+            // the same menu drawn in the game's own font, shown instead when the player's copy has it
+            p.spawn((ImageNode::default(), Node::default(), BackgroundColor(Color::srgba(0.05, 0.12, 0.08, 0.92)), Visibility::Hidden, launcher::LauncherImage));
         });
 }
 
@@ -1215,6 +1398,9 @@ fn menu_input(keys: Res<ButtonInput<KeyCode>>, mut menu: ResMut<Menu>, link: Res
             if menu.change(item, if step == 0 { 1 } else { step }) {
                 // applied at once, and remembered for the next start (#766)
                 audio_out::VOLUME.store(menu.volume as u32, std::sync::atomic::Ordering::Relaxed);
+                if item == MenuItem::Battery {
+                    link.0.lock().unwrap().battery_set = Some(menu.battery);
+                }
                 if let Ok(mut w) = windows.single_mut() {
                     w.present_mode = present_mode(menu.vsync);
                     w.mode = window_mode(menu.fullscreen);
@@ -1258,8 +1444,12 @@ fn show_frame(
     }
     if let Some((_, w, h, px)) = frame {
         // empty: the frame is on the GPU and `copy_gpu_frame` puts it in the screen texture
-        if w == W && h == H && !px.is_empty() {
+        if w > 0 && h > 0 && px.len() == (w * h * 4) as usize {
             if let Some(mut img) = images.get_mut(&screen.0) {
+                // a picture of another size (the software present at 1x under LMA_RES_SCALE)
+                if (img.width(), img.height()) != (w, h) {
+                    img.resize(Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+                }
                 // copy into the image's own buffer and hand the frame's back to the renderer: no
                 // fresh 3.7 MB allocation per frame on either side (#304, page faults)
                 match img.data.take() {
@@ -1384,6 +1574,20 @@ fn read_input(keys: Res<ButtonInput<KeyCode>>, mouse: Res<ButtonInput<MouseButto
 mod tests {
     use super::*;
 
+    /// Icons decode to RGBA whatever their PNG colour type: the game's title icon is RGB (an opaque
+    /// alpha added).
+    #[test]
+    fn icons_decode_to_rgba() {
+        let mut rgb = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut rgb, 2, 1);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&[10, 20, 30, 40, 50, 60]).unwrap();
+        }
+        assert_eq!(png_rgba(&rgb), Some((vec![10, 20, 30, 255, 40, 50, 60, 255], 2, 1)));
+    }
+
     /// Co-op (the maintainer, 22 Oct): off as before (keyboard + first pad are player 1); keyboard and pad
     /// split; one pad passed by turns, player 2 connected throughout.
     #[test]
@@ -1416,15 +1620,21 @@ mod tests {
         assert!(m.change(MenuItem::Window, -1) && m.fullscreen);
         assert!(m.change(MenuItem::WindowSize, -1));
         assert_eq!(config::WINDOW_SIZES[m.size], [2560, 1440], "left from the first size wraps to the last");
+        assert!(m.change(MenuItem::RenderScale, -1));
+        assert_eq!(m.scale, config::RENDER_SCALE_MAX, "left from 1x wraps to the largest");
+        assert!(m.change(MenuItem::RenderScale, 1) && m.scale == 1);
+        assert!(m.change(MenuItem::RenderScale, 1) && m.scale == 2);
         assert!(m.change(MenuItem::Volume, -1) && m.volume == 90);
         for _ in 0..12 {
             m.change(MenuItem::Volume, -1);
         }
         assert_eq!(m.volume, 0, "never below 0");
+        assert!(m.change(MenuItem::Battery, 1) && m.battery == config::BatterySaver::Always);
+        assert!(m.change(MenuItem::Battery, 1) && m.battery == config::BatterySaver::Off, "round the three choices");
         assert!(!m.change(MenuItem::Close, 1) && !m.change(MenuItem::FrameCap, 1), "the cap and Close are handled apart");
         m.sel = MENU_ITEMS.iter().position(|&i| i == MenuItem::Volume).unwrap();
         let t = m.text(60);
-        for line in ["  VSync          < off >", "  Window         < fullscreen >", "  Window size    < 2560 x 1440 >", "> Volume         < 0% >", "  Status line    < off >"] {
+        for line in ["  Battery saver  < off >", "  VSync          < off >", "  Window         < fullscreen >", "  Window size    < 2560 x 1440 >", "  Render scale   < 2x (1440p) >  (on next start)", "> Volume         < 0% >", "  Status line    < off >"] {
             assert!(t.contains(line), "{line:?} in\n{t}");
         }
     }

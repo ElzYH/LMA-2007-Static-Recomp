@@ -2803,8 +2803,8 @@ pub fn import_with(base: &Path, roster: &Path, sources: &Sources, cfg: &Config) 
                     continue;
                 }
                 if let Some((_, name)) = latest.get(tm.as_str()) {
-                    // LMA keeps a surname: the name's last word (Arteta, Guardiola)
-                    let surname = game_safe(name.split_whitespace().last().unwrap_or(name));
+                    // LMA keeps a surname: the name's last word (Arteta, Guardiola), with its particles
+                    let surname = game_safe(&manager_surname(name));
                     by_id.insert(*key, surname);
                     report.tm_managers += 1;
                 }
@@ -2862,7 +2862,7 @@ pub fn import_with(base: &Path, roster: &Path, sources: &Sources, cfg: &Config) 
                 // fc27final32 gave Arsenal "Lisa"
                 [id] if listed.contains(id) => report.listed_managers_unmatched.push(format!("{club} (its club already set by an earlier row)")),
                 [id] if !name.is_empty() => {
-                    by_id.insert(*id, game_safe(name.split_whitespace().last().unwrap_or(name)));
+                    by_id.insert(*id, game_safe(&manager_surname(name)));
                     listed.insert(*id);
                     match crep.map(|c| r[c].trim()).filter(|v| !v.is_empty()) {
                         Some(v) => match v.parse::<u32>() {
@@ -4720,8 +4720,6 @@ fn manager_abilities(staff: &Sheet, mc: &FmManagers) -> Result<ManagerAbility> {
     Ok(ab)
 }
 
-/// A manager's reputation (0-99) from his ability at his club (`fm_club`, the club's FM uid), else
-/// the one manager of that surname; None when neither knows him.
 /// A face (`lma_data::db::FACE`) for the importer's skin value (`[fm.skin] lma`: 0 light, 1 olive,
 /// 3 FM 11-15, 2 FM 16-20): a white, medium, brown or black set, oriental for a light or olive
 /// player of an oriental nation; the set's variant by `seed`.
@@ -4736,6 +4734,22 @@ fn face_for(skin: u32, oriental: bool, seed: u32) -> u32 {
     lma_data::db::FACE_SETS[set][(seed % 3) as usize]
 }
 
+/// A manager's surname as the game shows it: the last word of the full name, with the particles
+/// in front of it (Roberto De Zerbi -> "De Zerbi", Erik ten Hag -> "ten Hag"; #795: fc27 showed
+/// "Zerbi").
+pub fn manager_surname(name: &str) -> String {
+    const PARTICLES: [&str; 17] = ["de", "di", "da", "del", "della", "dos", "das", "do", "du", "van", "von", "der", "den", "ten", "ter", "le", "la"];
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let Some(mut first) = words.len().checked_sub(1) else { return String::new() };
+    // a name listed without its forename ("De Zerbi") keeps its particle too
+    while first > 0 && PARTICLES.contains(&words[first - 1].to_lowercase().as_str()) {
+        first -= 1;
+    }
+    words[first..].join(" ")
+}
+
+/// A manager's reputation (0-99) from his ability at his club (`fm_club`, the club's FM uid), else
+/// the one manager of that surname; None when neither knows him.
 fn manager_reputation(ab: &ManagerAbility, fm_club: Option<&str>, surname: &str, mc: &FmManagers) -> Option<u32> {
     let [lo, hi] = mc.reputation?;
     let key = surname.to_lowercase();
@@ -5298,6 +5312,21 @@ mod tests {
         let mut w = vec![(0, 0, 1.0), (1, 0, 50.0), (2, 0, 5.0), (3, 1, 0.5), (4, 1, 0.9)];
         rank_tiers(&mut w, &clubs);
         assert_eq!(w.iter().map(|x| x.1).collect::<Vec<_>>(), [3, 15, 9, 2, 8]);
+    }
+
+    /// A manager keeps the particles of his surname (#795: fc27 showed "Zerbi"); one-word and
+    /// two-word names as before.
+    #[test]
+    fn manager_surnames_keep_their_particles() {
+        assert_eq!(manager_surname("Roberto De Zerbi"), "De Zerbi");
+        assert_eq!(manager_surname("Erik ten Hag"), "ten Hag");
+        assert_eq!(manager_surname("Giovanni van Bronckhorst"), "van Bronckhorst");
+        assert_eq!(manager_surname("Mikel Arteta"), "Arteta");
+        assert_eq!(manager_surname("Luis Enrique"), "Enrique");
+        assert_eq!(manager_surname("Arne  Slot "), "Slot");
+        assert_eq!(manager_surname("Mourinho"), "Mourinho");
+        assert_eq!(manager_surname("De Zerbi"), "De Zerbi", "listed without a forename");
+        assert_eq!(manager_surname(""), "");
     }
 
     #[test]

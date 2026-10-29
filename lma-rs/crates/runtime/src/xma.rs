@@ -15,6 +15,8 @@
 
 /// Bytes in an XMA packet, and in an output block.
 pub const PACKET: usize = 2048;
+/// Frames a loop seam's step is faded out over (2.7 ms at 48 kHz).
+const SEAM_FADE: usize = 128;
 pub const BLOCK: usize = 256;
 
 /// Decodes one context's packets, in order, into PCM.
@@ -115,6 +117,12 @@ pub struct Channel {
     pub kicked: bool,
     /// Decoded samples not yet written to the output ring.
     pub pending: Vec<i16>,
+    /// The last sample frame decoded (one sample per channel), and at a loop's jump the frame the
+    /// loop ended on, to smooth the seam with (`smooth_seam`).
+    pub last: [i16; 2],
+    pub seam: Option<[i16; 2]>,
+    /// The seam's step being faded out: per channel, and frames done.
+    pub fade: Option<([i32; 2], usize)>,
     pub decoder: Option<Box<dyn Decoder>>,
     /// The (channels, rate) `decoder` was made for: a context the game reuses for another sound
     /// without clearing it gets a new decoder, never one decoding with the wrong layout (#199:
@@ -237,6 +245,7 @@ impl Channel {
             if !self.decoder.as_mut().unwrap().decode(&buf, &mut self.pending) {
                 self.decode_errors += 1;
             }
+            self.smooth_seam(n, if ctx.stereo { 2 } else { 1 });
             if self.dump_to.is_some() {
                 use std::io::Write;
                 let new: Vec<u8> = self.pending[n..].iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -260,7 +269,16 @@ impl Channel {
                 if ctx.loop_count != 255 {
                     ctx.loop_count -= 1;
                 }
-                self.decoder.as_mut().unwrap().reset();
+                // what the decoder holds back is the loop's last ~85 ms: out first, then afresh
+                // (a reset dropped it, a short jump each time a loop went round: #868's "spark")
+                self.decoder.as_mut().unwrap().drain(&mut self.pending);
+                let chs = if ctx.stereo { 2 } else { 1 };
+                if self.pending.len() >= chs {
+                    self.last[..chs].copy_from_slice(&self.pending[self.pending.len() - chs..]);
+                }
+                // the decoder starts the loop afresh, without the overlap of the frame before it:
+                // its first samples rise from silence, a step (a click) at every seam
+                self.seam = Some(self.last);
                 self.loop_jumps += 1;
                 self.dump = None; // a new sequence: the reference decode restarts here too
             } else {
@@ -279,6 +297,8 @@ impl Channel {
             self.decoder = make(format.0, format.1);
             self.format = format;
             self.pending.clear();
+            self.seam = None;
+            self.fade = None;
             self.dump = None;
         }
     }
@@ -317,8 +337,41 @@ impl Channel {
         self.seen = Some((ctx.output_read, avail));
     }
 
+    /// After a decode that appended `pending[n..]` (`chs` channels): remembers the last frame, and
+    /// after a loop's jump fades the step between the loop's end and its fresh start out over
+    /// SEAM_FADE frames (#868: the step was 8x a normal sample's change, heard as a spark).
+    fn smooth_seam(&mut self, n: usize, chs: usize) {
+        if self.pending.len() < n + chs {
+            return;
+        }
+        if let Some(end) = self.seam.take() {
+            let mut d = [0i32; 2];
+            for c in 0..chs {
+                d[c] = end[c] as i32 - self.pending[n + c] as i32;
+            }
+            self.fade = Some((d, 0));
+        }
+        if let Some((d, mut done)) = self.fade {
+            for f in self.pending[n..].chunks_exact_mut(chs) {
+                if done >= SEAM_FADE {
+                    break;
+                }
+                for c in 0..chs {
+                    let v = f[c] as i32 + d[c] * (SEAM_FADE - done) as i32 / SEAM_FADE as i32;
+                    f[c] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                }
+                done += 1;
+            }
+            self.fade = (done < SEAM_FADE).then_some((d, done));
+        }
+        let len = self.pending.len();
+        self.last[..chs].copy_from_slice(&self.pending[len - chs..]);
+    }
+
     pub fn clear(&mut self) {
         self.resets += 1;
+        self.seam = None;
+        self.fade = None;
         self.seen = None;
         self.enabled = false;
         self.pending.clear();
@@ -437,10 +490,96 @@ mod tests {
         };
         let mut ch = Channel { enabled: true, decoder: Some(Box::new(Fake)), ..Default::default() };
         ch.work(&mut ctx, &mut ram);
-        let firsts: Vec<i16> = (0..ch.packets as usize).map(|k| i16::from_be_bytes([ram.0[0x8000 + 600 * k], ram.0[0x8001 + 600 * k]])).collect();
+        // each packet's sample 130 (a seam's fade, SEAM_FADE frames, changes only the first ones)
+        let firsts: Vec<i16> = (0..ch.packets as usize).map(|k| i16::from_be_bytes([ram.0[0x8000 + 600 * k + 260], ram.0[0x8001 + 600 * k + 260]])).collect();
         // stream 0 only (10, 12), looped twice back to packet 0, then on to packet 4
         assert_eq!(firsts[..7], [10, 12, 10, 12, 10, 12, 14]);
         assert_eq!(ctx.loop_count, 0);
+    }
+
+    /// Holds each packet's samples back until the next packet, as FFmpeg does.
+    struct Late(Option<i16>);
+    impl Decoder for Late {
+        fn decode(&mut self, packet: &[u8], out: &mut Vec<i16>) -> bool {
+            if let Some(v) = self.0.replace(packet[0] as i16) {
+                out.extend(std::iter::repeat_n(v, 300));
+            }
+            true
+        }
+        fn reset(&mut self) {
+            self.0 = None;
+        }
+        fn drain(&mut self, out: &mut Vec<i16>) {
+            if let Some(v) = self.0.take() {
+                out.extend(std::iter::repeat_n(v, 300));
+            }
+        }
+    }
+
+    /// #868: a loop's jump drains the decoder, so the loop's last packet is heard every time round.
+    #[test]
+    fn a_loop_keeps_its_last_packet() {
+        let mut ram = Ram(vec![0; 0x10000]);
+        for p in 0..3 {
+            ram.0[0x1000 + p * PACKET] = 10 + p as u8;
+        }
+        let mut ctx = Context {
+            input_packets: [3, 0],
+            input_valid: [true, false],
+            input_ptr: [0x1000, 0],
+            input_read_offset: 32,
+            loop_start: 32,
+            loop_end: (PACKET * 8 + 100) as u32,
+            loop_count: 1,
+            output_blocks: 31,
+            output_valid: true,
+            output_ptr: 0x8000,
+            ..Default::default()
+        };
+        let mut ch = Channel { enabled: true, decoder: Some(Box::new(Late(None))), ..Default::default() };
+        ch.work(&mut ctx, &mut ram);
+        let firsts: Vec<i16> = (0..4).map(|k| i16::from_be_bytes([ram.0[0x8000 + 600 * k + 260], ram.0[0x8001 + 600 * k + 260]])).collect();
+        // packets 0, 1, back to 0, 1, then 2: nothing of the first time round is lost
+        assert_eq!(firsts, [10, 11, 10, 11]);
+    }
+
+    /// #868: the loop's fresh start is pulled to the level the loop ended on, then fades to its own
+    /// samples over SEAM_FADE frames: no step at the seam.
+    #[test]
+    fn a_loop_seam_has_no_step() {
+        struct Level;
+        impl Decoder for Level {
+            fn decode(&mut self, packet: &[u8], out: &mut Vec<i16>) -> bool {
+                out.extend(std::iter::repeat_n(packet[0] as i16 * 100, 300));
+                true
+            }
+            fn reset(&mut self) {}
+        }
+        let mut ram = Ram(vec![0; 0x10000]);
+        ram.0[0x1000] = 1; // the loop starts at level 100
+        ram.0[0x1000 + PACKET] = 30; // and ends at 3000
+        let mut ctx = Context {
+            input_packets: [2, 0],
+            input_valid: [true, false],
+            input_ptr: [0x1000, 0],
+            input_read_offset: 32,
+            loop_start: 32,
+            loop_end: (PACKET * 8 + 100) as u32,
+            loop_count: 1,
+            output_blocks: 31,
+            output_valid: true,
+            output_ptr: 0x8000,
+            ..Default::default()
+        };
+        let mut ch = Channel { enabled: true, decoder: Some(Box::new(Level)), ..Default::default() };
+        ch.work(&mut ctx, &mut ram);
+        let out: Vec<i16> = (0..1200).map(|k| i16::from_be_bytes([ram.0[0x8000 + 2 * k], ram.0[0x8001 + 2 * k]])).collect();
+        assert_eq!((out[0], out[299], out[300], out[599]), (100, 100, 3000, 3000), "the first time round is as decoded");
+        // the seam: 3000, then 3000 again (the start pulled up), falling to 100 over SEAM_FADE frames
+        assert_eq!(out[600], 3000);
+        assert!(out[600..600 + SEAM_FADE].windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] <= 25), "a smooth fall");
+        assert_eq!(out[600 + SEAM_FADE], 100);
+        assert!(ch.fade.is_none() && ch.seam.is_none());
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod audio;
 pub mod backchain;
 pub mod content;
 pub mod cp_thread;
+pub mod events;
 // moved to the `guest` crate (the interface recompiled code depends on); same paths as before
 pub use guest::{cpu, mem, rec, vmx};
 pub use guest::mmio;

@@ -77,6 +77,8 @@ def main():
                 left = length
                 while left:
                     chunk = f.read(min(left, 1 << 22))
+                    if not chunk:
+                        raise SystemExit(f"{path}: the image is truncated ({left} of {length} bytes missing)")
                     o.write(chunk)
                     left -= len(chunk)
             print(path, length)

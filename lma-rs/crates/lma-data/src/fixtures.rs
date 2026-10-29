@@ -46,7 +46,8 @@ pub fn fake_db_with(players: usize) -> Database {
         ("Clubs.bin".into(), table(0x5ABE_B540, 84, 3)),
         ("StadName.bin".into(), fixed(&["Highbury", "Goodison Park"], 40)),
         ("Stadiums.bin".into(), vec![0; 2 * 32]),
-        ("Managers.bin".into(), vec![0; 3 * 36]),
+        // one per club, then two unattached (the job market)
+        ("Managers.bin".into(), vec![0; 5 * 36]),
     ];
     for l in LANGS {
         files.push((format!("ClubNam{l}.bin"), fixed(&clubs, 26)));

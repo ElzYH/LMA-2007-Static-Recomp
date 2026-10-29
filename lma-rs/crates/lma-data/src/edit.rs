@@ -23,6 +23,8 @@
 //! club id: this id takes that whole club, record, squad and names; leagues are id ranges, so this
 //! is how a club changes league; applied before everything else, which then names the new ids).
 //! `squad_size` is ignored.
+//! free_managers.csv (#795): the unattached managers, after the clubs' own records: `slot`
+//! (0.., required), `manager` (surname), `manager_rep` (0-99). Rows not listed keep theirs.
 
 use crate::csv::{write_row, Sheet};
 use crate::db::{Field, Position, AGE, FACE, FOOT, HAIR, HAIR_COLOUR, HEIGHT, LANGS, NATION, RATINGS, SIDES, SKIN, SQUAD_MAX, SQUAD_NUMBER, VALUE};
@@ -121,6 +123,13 @@ pub fn export(db: &Database, dir: &Path) -> Result<()> {
         write_row(&mut out, &row);
     }
     std::fs::write(dir.join("clubs.csv"), out)?;
+
+    let mut out = String::from("\u{feff}");
+    write_row(&mut out, &["slot", "manager", "manager_rep"]);
+    for (slot, mi) in (db.club_count()..db.manager_count()).enumerate() {
+        write_row(&mut out, &[slot.to_string(), db.manager_surname(mi).to_string(), db.manager_reputation(mi).map(|r| r.to_string()).unwrap_or_default()]);
+    }
+    std::fs::write(dir.join("free_managers.csv"), out)?;
 
     let mut out = String::from("\u{feff}");
     write_row(&mut out, &["nation_id", "name", "players", "best_players"]);
@@ -385,8 +394,9 @@ pub fn apply(db: &mut Database, dir: &Path) -> Result<Vec<String>> {
     let mut errors = Vec::new();
     let (players, clubs, history, cups) = (dir.join("players.csv"), dir.join("clubs.csv"), dir.join("history.csv"), dir.join("cups.csv"));
     let last_tables = dir.join("last_tables.csv");
-    if !players.exists() && !clubs.exists() && !history.exists() && !cups.exists() && !last_tables.exists() {
-        return Err(Error::Value(format!("{}: no players.csv, clubs.csv, history.csv, cups.csv or last_tables.csv", dir.display())));
+    let free_managers = dir.join("free_managers.csv");
+    if !players.exists() && !clubs.exists() && !history.exists() && !cups.exists() && !last_tables.exists() && !free_managers.exists() {
+        return Err(Error::Value(format!("{}: no players.csv, clubs.csv, history.csv, cups.csv, last_tables.csv or free_managers.csv", dir.display())));
     }
     let clubs = if clubs.exists() { Some(Sheet::read(&clubs)?) } else { None };
     let squads_before: Vec<usize> = (0..db.club_count()).map(|ci| db.squad(ci).len()).collect();
@@ -410,6 +420,9 @@ pub fn apply(db: &mut Database, dir: &Path) -> Result<Vec<String>> {
     }
     if last_tables.exists() {
         apply_last_tables(db, &Sheet::read(&last_tables)?, &mut errors);
+    }
+    if free_managers.exists() {
+        apply_free_managers(db, &Sheet::read(&free_managers)?, &mut errors);
     }
     // a club that fielded a team must still field one: the match engine's event picker loops for
     // ever on a side with no eligible player (#31: fc27final3's 1-player squads hung careers)
@@ -580,6 +593,34 @@ fn apply_clubs(db: &mut Database, sheet: &Sheet, errors: &mut Vec<String>) {
     }
 }
 
+/// The unattached managers (#795): `slot` k is manager record club_count() + k.
+fn apply_free_managers(db: &mut Database, sheet: &Sheet, errors: &mut Vec<String>) {
+    let slots = db.manager_count() - db.club_count();
+    let Some(slot_col) = sheet.col("slot") else { return errors.push("free_managers.csv: no slot column".into()) };
+    for row in &sheet.rows {
+        let Some(slot) = sheet.get(row, Some(slot_col)).and_then(|v| v.parse::<usize>().ok()).filter(|&s| s < slots) else {
+            errors.push(format!("free_managers.csv: slot {:?} out of range (0..{})", sheet.get(row, Some(slot_col)).unwrap_or(""), slots.saturating_sub(1)));
+            continue;
+        };
+        if let Err(e) = apply_free_manager(db, sheet, row, db.club_count() + slot) {
+            errors.push(format!("free manager {slot}: {e}"));
+        }
+    }
+}
+
+fn apply_free_manager(db: &mut Database, sheet: &Sheet, row: &[String], mi: usize) -> Result<()> {
+    let cell = |n: &str| sheet.get(row, sheet.col(n));
+    if let Some(v) = cell("manager") {
+        if v != db.manager_surname(mi) {
+            db.set_manager_surname(mi, v)?;
+        }
+    }
+    if let Some(v) = cell("manager_rep") {
+        db.set_manager_reputation(mi, v.parse().map_err(|_| Error::Value(format!("manager_rep {v:?} must be 0-99")))?)?;
+    }
+    Ok(())
+}
+
 fn apply_club(db: &mut Database, sheet: &Sheet, row: &[String], ci: usize) -> Result<()> {
     let cell = |n: &str| sheet.get(row, sheet.col(n));
     let check = |what: &str, v: &str, max: usize| match crate::text::encode(v) {
@@ -705,6 +746,27 @@ pub(crate) mod tests {
         let r = apply(db, &dir);
         std::fs::remove_dir_all(&dir).unwrap();
         r
+    }
+
+    /// The unattached managers: exported after the clubs' own, written by slot, the clubs' own
+    /// records untouched; a slot past the end or a bad reputation is an error.
+    #[test]
+    fn free_managers_by_slot() {
+        let mut db = fake_db();
+        assert_eq!((db.club_count(), db.manager_count()), (3, 5));
+        let clubs: Vec<String> = (0..3).map(|i| db.manager_surname(i).to_string()).collect();
+        let before = db.manager_surname(3).to_string();
+        apply_csv(&mut db, "free_mgr", &[("free_managers.csv", "slot,manager,manager_rep\n1,Moyes,80\n")]).unwrap();
+        assert_eq!((db.manager_surname(4), db.manager_reputation(4)), ("Moyes", Some(80)));
+        assert_eq!(db.manager_surname(3), before, "slot 0 not listed: kept");
+        assert_eq!((0..3).map(|i| db.manager_surname(i).to_string()).collect::<Vec<_>>(), clubs, "the clubs' managers keep theirs");
+        let dir = tmp("free_mgr_export");
+        export(&db, &dir).unwrap();
+        let csv = std::fs::read_to_string(dir.join("free_managers.csv")).unwrap();
+        assert!(csv.lines().nth(2).unwrap().starts_with("1,Moyes,80"), "{csv}");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(apply_csv(&mut db, "free_mgr_far", &[("free_managers.csv", "slot,manager\n2,Moyes\n")]).unwrap_err().to_string().contains("out of range"));
+        assert!(apply_csv(&mut db, "free_mgr_rep", &[("free_managers.csv", "slot,manager_rep\n0,100\n")]).is_err());
     }
 
     #[test]

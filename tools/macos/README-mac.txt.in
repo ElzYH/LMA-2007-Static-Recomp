@@ -1,0 +1,14 @@
+LMA Manager 2007 native port, {version}, macOS (Apple Silicon), commit {commit}
+PGO + sound build (FFmpeg linked in statically: nothing to install). No game files are included: you need your own disc's files.
+
+Run:    ./lma-app /path/to/LMA_full/default.xex     (remembered after the first run)
+        The launcher opens: pick a Version, then Continue / New boot / a save state.
+        Versions (mods/menu.txt): Modded 2026/27 season ({mod}), Vanilla+ (the original game
+        with this port's conveniences), Vanilla (the original game exactly as it shipped).
+        Each version keeps its own quick save (states/<id>/) and careers (userdata/<id>/).
+Mods:   mods/ next to lma-app holds the 2026/27 season (careers start 1 Jul 2026). Keep it beside lma-app.
+Keys:   F5 save, F9 load, F1 turbo, F2 settings (battery saver, co-op, render scale)
+        (Cmd+S / Cmd+L / Cmd+T on Mac keyboards).
+Source: source/ is this build's code (no game code in it). The binaries here already hold the game,
+        so it isn't needed to play; it's what a first run without them builds from your disc.
+Check:  gated against the previous play build ({previous}): {gate}

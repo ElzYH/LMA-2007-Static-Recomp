@@ -121,8 +121,8 @@ fn open(engine: Arc<Mutex<Engine>>) -> Option<cpal::Stream> {
                 resample.fill(&mut buf, |src| {
                     // never wait for the main thread here (it holds the engine while it prepares
                     // a cue): a busy engine is one buffer of silence, not a stall of the device
-                    if let Ok(mut e) = engine.try_lock() {
-                        e.mixer.mix(src);
+                    if let Ok(e) = engine.try_lock() {
+                        e.mixer().mix(src);
                     }
                 });
                 for (f, s) in data.chunks_mut(channels.max(1)).zip(&buf) {

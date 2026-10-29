@@ -22,14 +22,18 @@ fn main() -> ExitCode {
         Some("xex-info") if args.len() >= 2 => xex_info(&args[1], args.get(3).filter(|_| args[2] == "--dump-image")),
         Some("player") if args.len() == 3 => player(&args[1], &args[2]),
         Some("diary") if (2..=3).contains(&args.len()) => diary(&args[1], args.get(2).map(String::as_str)),
+        Some("disc") if args.len() >= 3 && (args[2] == "list" || (args[2] == "extract" && args.len() == 4)) => disc(&args[1], &args[2], args.get(3).map(String::as_str)),
         Some("db-export") if args.len() == 3 => db_export(&args[1], &args[2]),
         Some("db-import") if args.len() == 4 => db_import(&args[1], &args[2], &args[3]),
         Some("squad-import") if args.len() >= 6 && args.len() % 2 == 0 => squad_import(&args[1..]),
         Some("scan-code") if args.len() == 2 => scan_code(&args[1]),
+        Some("tune-list") if args.len() <= 2 => tune_list(args.get(1).map(String::as_str)),
         #[cfg(feature = "xma-ffmpeg")]
         Some("xma-check") if args.len() >= 4 && args[1] == "--cache" => xma_check::check_cache(&args[2], &args[3], args.get(4).map(|s| s.as_str())),
         #[cfg(feature = "xma-ffmpeg")]
         Some("audio-cache") if (3..=4).contains(&args.len()) => xma_check::build_cache(&args[1], &args[2], args.get(3).map(|s| s.as_str())),
+        // lma-cli xex-icon <default.xex> <out.png>: the title's own icon from the player's disc (its XDBF image 0x8000)
+        Some("xex-icon") if args.len() == 3 => xex_icon(&args[1], &args[2]),
         #[cfg(feature = "xma-ffmpeg")]
         Some("xma-check") if args.len() >= 2 => xma_check::main(&args[1], args.get(2).map(|s| s.as_str()), args.get(3).and_then(|s| s.parse().ok())),
         Some("archive") if args.len() >= 3 && (args[2] == "ls" || (args[2] == "extract" && args.len() == 4)) => archive(&args[1], &args[2], args.get(3).map(String::as_str)),
@@ -43,7 +47,7 @@ fn main() -> ExitCode {
         Some("overall-check") if args.len() == 3 => overall_check(&args[1], &args[2]),
         Some("wgsl") if args.len() >= 2 => wgsl(&args[1..]),
         Some("run") if args.len() >= 2 => run(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50_000_000), mod_id),
-        _ => Err("usage: lma-cli xex-info <default.xex> [--dump-image out.bin] | player <Export.mng> <id> | diary <Export.mng> [season 0-19] | db-export <Export.mng> <csv_dir> | db-import <Export.mng> <csv_dir> <out.mng> | archive <file.mng> ls | archive <file.mng> extract <dir> | textures <file.mng> <out_dir> | strings <LMA_E.lng or the Lang dir> [out.csv] | sounds <bank.xwb or Sound.mng> <cache_dir> <out_dir> [bank.xsb] | run <default.xex> [max_instructions] [--mod <name>] | compare <default.xex> <state> (--write-ref <dir> | --ref <dir>) | state-mem <default.xex> <state> <out.bin>".into()),
+        _ => Err("usage: lma-cli tune-list [default.xex] | xex-info <default.xex> [--dump-image out.bin] | player <Export.mng> <id> | diary <Export.mng> [season 0-19] | disc <image.iso | GOD header or folder | game folder> list | extract <out_dir> | db-export <Export.mng> <csv_dir> | db-import <Export.mng> <csv_dir> <out.mng> | archive <file.mng> ls | archive <file.mng> extract <dir> | textures <file.mng> <out_dir> | strings <LMA_E.lng or the Lang dir> [out.csv] | sounds <bank.xwb or Sound.mng> <cache_dir> <out_dir> [bank.xsb] | run <default.xex> [max_instructions] [--mod <name>] | compare <default.xex> <state> (--write-ref <dir> | --ref <dir>) | state-mem <default.xex> <state> <out.bin>".into()),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,
@@ -55,6 +59,46 @@ fn main() -> ExitCode {
 }
 
 type Res = Result<(), Box<dyn std::error::Error>>;
+
+/// `tune-list [default.xex]`: the game numbers mod.toml's `[tune]` sets (`guest::tune::TUNABLES`), as a
+/// Markdown table for MODS.md; with the player's xex, the tables' own values too.
+fn tune_list(xex: Option<&str>) -> Res {
+    let image = match xex {
+        Some(p) => Some(xex::Xex::parse(&std::fs::read(p)?)?),
+        None => None,
+    };
+    let word = |a: u32| -> Option<i32> {
+        let x = image.as_ref()?;
+        let o = a.checked_sub(x.image_base)? as usize;
+        Some(i32::from_be_bytes(x.image.get(o..o + 4)?.try_into().ok()?))
+    };
+    let byte = |a: u32| -> Option<u8> {
+        let x = image.as_ref()?;
+        x.image.get(a.checked_sub(x.image_base)? as usize).copied()
+    };
+    println!("| name | where | game's value | range | what it does |");
+    println!("|---|---|---|---|---|");
+    for t in guest::tune::TUNABLES {
+        let (at, vanilla) = match t.kind {
+            guest::tune::Kind::Imm(w) => {
+                let n = 1 + t.also.len();
+                (format!("`{:#x}`{}", t.site, if n > 1 { format!(" (+{} more)", n - 1) } else { String::new() }), guest::tune::imm(w).to_string())
+            }
+            guest::tune::Kind::F32 => (format!("`{:#x}` (float)", t.site), word(t.site).map_or("a float".into(), |v| f32::from_bits(v as u32).to_string())),
+            guest::tune::Kind::Table(n) => {
+                let vals: Option<Vec<String>> = (0..n).map(|k| word(t.site + 4 * k).map(|v| v.to_string())).collect();
+                (format!("`{:#x}`, {n} words", t.site), vals.map_or(format!("a table of {n}"), |v| format!("[{}]", v.join(", "))))
+            }
+            guest::tune::Kind::Bytes(n) => {
+                let vals: Option<Vec<String>> = (0..n).map(|k| byte(t.site + k).map(|v| v.to_string())).collect();
+                (format!("`{:#x}`, {n} bytes", t.site), vals.map_or(format!("a table of {n}"), |v| format!("[{}]", v.join(", "))))
+            }
+        };
+        let range = if t.kind == guest::tune::Kind::F32 { format!("{}..={}", t.min as f64 / 100.0, t.max as f64 / 100.0) } else { format!("{}..={}", t.min, t.max) };
+        println!("| `{}` | {at} | {vanilla} | {range} | {} |", t.name, t.what);
+    }
+    Ok(())
+}
 
 fn xex_info(path: &str, dump: Option<&String>) -> Res {
     let x = xex::Xex::parse(&std::fs::read(path)?)?;
@@ -547,6 +591,32 @@ fn text_section(x: &xex::Xex) -> (u32, u32) {
     x.sections().into_iter().find(|s| s.0 == ".text").map_or((x.image_base, x.image.len() as u32), |s| (s.1, s.2))
 }
 
+/// `disc <path> list | extract <out_dir>` (#766 b): the user's disc (an XISO image, a Games-on-Demand
+/// package or an extracted folder) listed, or extracted (resumable: files already there are skipped).
+fn disc(path: &str, cmd: &str, out: Option<&str>) -> Res {
+    let mut d = lma_data::disc::Disc::open(std::path::Path::new(path))?;
+    if cmd == "list" {
+        let entries = d.entries()?;
+        for e in &entries {
+            println!("{} {:12} {}", if e.dir { 'D' } else { 'F' }, e.size, e.path);
+        }
+        let (files, bytes) = entries.iter().filter(|e| !e.dir).fold((0, 0u64), |(n, b), e| (n + 1, b + e.size as u64));
+        eprintln!("{:?}: {files} files, {:.1} MB", d.kind(), bytes as f64 / 1e6);
+        return Ok(());
+    }
+    let out = std::path::Path::new(out.unwrap());
+    let mut last = 0u64;
+    let n = d.extract(out, |_| true, |done, total| {
+        // a line per 5% (the whole disc is ~7 GB)
+        if total > 0 && done * 20 / total > last {
+            last = done * 20 / total;
+            eprintln!("{:3}%  {:.0} / {:.0} MB", done * 100 / total, done as f64 / 1e6, total as f64 / 1e6);
+        }
+    })?;
+    eprintln!("{n} files written to {}", out.display());
+    Ok(())
+}
+
 /// `diary <Export.mng> [season]` (#703): a season's calendar as CSV (the transfer windows as comment
 /// lines, then every round with its league, date and fixtures as clubs.csv ids); all 20 without a season.
 fn diary(path: &str, season: Option<&str>) -> Res {
@@ -616,6 +686,14 @@ fn functions(x: &xex::Xex) -> Vec<(u32, u32)> {
             (start != 0).then_some((start, ((packed >> 8) & 0x3F_FFFF) * 4))
         })
         .collect()
+}
+
+/// `lma-cli xex-icon <default.xex> <out.png>`: the title's own icon (the XDBF image 0x8000 of its
+/// resource), written as the PNG it is. From the player's disc; never shipped.
+fn xex_icon(xex_path: &str, out: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let x = xex::Xex::parse(&std::fs::read(xex_path)?).map_err(|e| e.0)?;
+    std::fs::write(out, x.title_icon_png().ok_or("no title icon in this xex")?)?;
+    Ok(())
 }
 
 fn scan_code(path: &str) -> Res {
@@ -983,8 +1061,22 @@ fn run(path: &str, limit: u64, mod_id: Option<String>) -> Res {
     }
     if let Ok(path) = std::env::var("LMA_SAVE") {
         let t = std::time::Instant::now();
-        let n = m.save_state(std::path::Path::new(&path))?;
+        // LMA_SAVE_BG=1: the black box's background save (lma-app); the time is the game thread's
+        let n = if std::env::var("LMA_SAVE_BG").as_deref() == Ok("1") {
+            let w = m.save_state_background(path.clone().into());
+            eprintln!("game thread: {:.2?}", t.elapsed());
+            w.join().map_err(|_| "the state writer panicked")??
+        } else {
+            m.save_state(std::path::Path::new(&path))?
+        };
         eprintln!("saved {path}: {:.1} MB in {:.2?}", n as f64 / 1e6, t.elapsed());
+    }
+    // LMA_EVENTS=<file>: the black box's event log (every sound started, repeats flagged)
+    if let Ok(path) = std::env::var("LMA_EVENTS") {
+        std::fs::write(&path, runtime::events::dump())?;
+        while let Some(why) = runtime::events::take_repeat() {
+            eprintln!("black box: {why}");
+        }
     }
     // LMA_INTERP_STATS=1: instructions run through rec::interp, by mnemonic (what to translate next)
     if let Some(stats) = runtime::rec::INTERP_STATS.lock().unwrap().take() {
@@ -1171,7 +1263,7 @@ fn wgsl(args: &[String]) -> Res {
     if bad > 0 { Err("some shaders failed to validate".into()) } else { Ok(()) }
 }
 
-/// `squad-import <db-export dir> <roster.csv> <mapping.toml> <mods dir> <mod name> [--fm <csv>] [--tm <csv>] [--staff <csv>] [--tm-clubs <csv>] [--tm-lineups <csv>] [--tm-games <csv>] [--transfers <csv>] [--patches <toml>] [--from <mod dir>]`: build a
+/// `squad-import <db-export dir> <roster.csv> <mapping.toml> <mods dir> <mod name> [--free-managers <csv>] [--fm <csv>] [--tm <csv>] [--staff <csv>] [--tm-clubs <csv>] [--tm-lineups <csv>] [--tm-games <csv>] [--transfers <csv>] [--patches <toml>] [--from <mod dir>]`: build a
 /// mod space from a real-world roster (see `lma-import` and `mappings/fc27.toml`).
 fn squad_import(a: &[String]) -> Res {
     let (base, roster, mapping, mods, name) = (&a[0], &a[1], &a[2], &a[3], &a[4]);
@@ -1182,7 +1274,7 @@ fn squad_import(a: &[String]) -> Res {
     // csv> (league histories), --transfers <player,club csv>
     // (moves the sources lack), --patches <toml>
     let opt = |flag: &str| a[5..].chunks(2).find(|c| c[0] == flag).and_then(|c| c.get(1)).map(std::path::Path::new);
-    if let Some(bad) = a[5..].chunks(2).find(|c| !["--fm", "--tm", "--staff", "--tm-clubs", "--tm-lineups", "--tm-games", "--transfers", "--managers", "--tm-live", "--patches", "--budgets", "--weights", "--history-extra", "--tm-events", "--cup-extra", "--from"].contains(&c[0].as_str())) {
+    if let Some(bad) = a[5..].chunks(2).find(|c| !["--fm", "--tm", "--staff", "--tm-clubs", "--tm-lineups", "--tm-games", "--transfers", "--managers", "--tm-live", "--patches", "--budgets", "--weights", "--history-extra", "--tm-events", "--cup-extra", "--from", "--free-managers"].contains(&c[0].as_str())) {
         return Err(format!("squad-import: unknown option {:?}", bad[0]).into());
     }
     // --patches <toml>: the [[patch]] tables to copy into mod.toml (e.g. an earlier mod's)
@@ -1199,6 +1291,23 @@ fn squad_import(a: &[String]) -> Res {
     let dir = std::path::Path::new(mods).join(name);
     std::fs::create_dir_all(dir.join("database"))?;
     std::fs::write(dir.join("database").join("players.csv"), &players)?;
+    // --free-managers <csv>: `manager[,manager_rep]`, real managers out of work, written in order to
+    // the unattached records the game hires from (database/free_managers.csv, #795)
+    if let Some(p) = opt("--free-managers") {
+        let sheet = lma_data::csv::Sheet::read(p)?;
+        let m = sheet.col("manager").ok_or_else(|| format!("{}: no manager column", p.display()))?;
+        let rep = sheet.col("manager_rep");
+        let mut out = String::from("\u{feff}");
+        lma_data::csv::write_row(&mut out, &["slot", "manager", "manager_rep"]);
+        let mut slot = 0;
+        for r in sheet.rows.iter().filter(|r| !r[m].trim().is_empty()) {
+            let rep = rep.map(|c| r[c].trim().to_string()).unwrap_or_default();
+            lma_data::csv::write_row(&mut out, &[slot.to_string(), lma_import::game_safe(&lma_import::manager_surname(&r[m])), rep]);
+            slot += 1;
+        }
+        std::fs::write(dir.join("database").join("free_managers.csv"), out)?;
+        eprintln!("free managers: {slot} written from {}", p.display());
+    }
     // division changes (#31 item 7); a previous import's file goes when nothing moves now
     let clubs_csv = dir.join("database").join("clubs.csv");
     match clubs {

@@ -119,6 +119,9 @@ pub struct Machine {
     pub fence_polls: HashMap<usize, (u32, u32)>,
     /// A hook asked for the current thread to sleep until this guest time before going on.
     pub nap_until: Option<u64>,
+    /// With `nap_until`: wake early once one of these guest words differs from its value here
+    /// (`Wait::GpuMoved`, the native fence wait).
+    pub nap_watch: Option<([u32; 2], [u32; 2])>,
     /// LMA_AUDIO=1 (#199): the XAudio render driver (`crate::audio`).
     pub audio: crate::audio::Audio,
     /// LMA_CP_THREAD=1: the command processor's own thread, in live play (`crate::cp_thread`).
@@ -300,6 +303,7 @@ impl Machine {
             squad_overflow_uids: HashMap::new(),
             fence_polls: HashMap::new(),
             nap_until: None,
+            nap_watch: None,
             audio: crate::audio::Audio::new(),
             cp: None,
             cp_thread_env: match std::env::var("LMA_CP_THREAD").as_deref() {
@@ -824,6 +828,23 @@ impl Machine {
         if let (true, Some(Some(game))) = (crate::hooks::search_prefilter_on() && !self.hooks.contains_key(&crate::hooks::SEARCH_FILTER), self.blocks.get(i).copied()) {
             self.blocks[i] = Some(crate::hooks::search_filter_block_for(game));
         }
+        // the league-phase European Cup (#703): its round-42 draw native, the game's draws behind it
+        let i = (crate::hooks::EUROPEAN_CUP_DRAW - BLOCK_BASE) as usize >> 2;
+        if let (true, Some(Some(game))) = (crate::hooks::LEAGUE_PHASE.load(std::sync::atomic::Ordering::Relaxed), self.blocks.get(i).copied()) {
+            self.blocks[i] = Some(crate::hooks::european_cup_draw_block_for(game));
+            if crate::hooks::LEAGUE_LIST.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                let list = self.alloc_small(0x408);
+                crate::hooks::LEAGUE_LIST.store(list, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let i = (crate::hooks::GROUP_END - BLOCK_BASE) as usize >> 2;
+        if let (true, Some(Some(game))) = (crate::hooks::LEAGUE_PHASE.load(std::sync::atomic::Ordering::Relaxed), self.blocks.get(i).copied()) {
+            self.blocks[i] = Some(crate::hooks::group_end_block_for(game));
+        }
+        let i = (crate::hooks::STANDINGS_READ - BLOCK_BASE) as usize >> 2;
+        if let (true, Some(Some(game))) = (crate::hooks::LEAGUE_PHASE.load(std::sync::atomic::Ordering::Relaxed), self.blocks.get(i).copied()) {
+            self.blocks[i] = Some(crate::hooks::standings_read_block_for(game));
+        }
         // mod `bench` 6-9 (#530): the substitution can bring on the first reserves after the
         // matchday 16; the lookup is native and the builder clears their stored slot images
         if crate::hooks::BENCH_EXTRA.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -880,6 +901,13 @@ impl Machine {
                 }
             } else {
                 eprintln!("native audio: {} of {} XACT entry points found, off", game.len(), crate::native_audio::HOOKS.len());
+            }
+        }
+        // mod `rating_wage_scale`: the wage from a player's rating x the scale (#704)
+        if crate::hooks::RATING_WAGE_SCALE.load(std::sync::atomic::Ordering::Relaxed) != 1000 {
+            let i = (crate::hooks::RATING_WAGE - BLOCK_BASE) as usize >> 2;
+            if let Some(Some(game)) = self.blocks.get(i).copied() {
+                self.blocks[i] = Some(crate::hooks::rating_wage_block_for(game));
             }
         }
         // mod `ai_wage_offers`: wages rounded up to WAGE_MAX, AI offers at least the wage + 10%
@@ -989,9 +1017,13 @@ impl Machine {
                 }
                 // a hook may put the thread to sleep (the fence nap, #312): it resumes here, at
                 // the function (declined) or after it (handled), once the time has passed
+                let watch = self.nap_watch.take();
                 if let Some(d) = self.nap_until.take() {
                     if d > self.now() {
-                        self.threads[self.cur].state = State::Waiting(Wait::Nap(d));
+                        self.threads[self.cur].state = State::Waiting(match watch {
+                            Some((words, last)) => Wait::GpuMoved { words, last, deadline: d },
+                            None => Wait::Nap(d),
+                        });
                         return None;
                     }
                 }
@@ -2466,14 +2498,22 @@ struct Snapshot {
 
 const SNAPSHOT_MAGIC: &str = "LMA2007-SAVESTATE-1";
 
+/// A state file: the snapshot, then `tail` (`Machine::state_tail`), in one lz4 frame.
+fn write_snapshot(path: &std::path::Path, snap: &Snapshot, tail: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut enc = lz4_flex::frame::FrameEncoder::new(file);
+    bincode::serialize_into(&mut enc, snap).map_err(std::io::Error::other)?;
+    enc.write_all(tail)?;
+    // flush explicitly: a dropped BufWriter swallows its last write error
+    let mut file = enc.finish().map_err(std::io::Error::other)?;
+    file.flush()?;
+    file.get_ref().sync_all()
+}
+
 impl Machine {
-    /// Write a save state (lz4-compressed). Returns the compressed size in bytes.
-    pub fn save_state(&mut self, path: &std::path::Path) -> std::io::Result<u64> {
-        self.par_join();
-        self.cp_join();
-        // GPU writes still in flight (resolve copies, deferred fence writes) belong in the state
-        self.gpu.fence(&mut self.mem);
-        let snap = Snapshot {
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
             magic: SNAPSHOT_MAGIC.into(),
             image_base: self.image_base,
             cpu: self.cpu.clone(),
@@ -2493,7 +2533,16 @@ impl Machine {
             vfs: self.vfs.save_state(),
             gpu: self.gpu.save_state(),
             pages: self.mem.snapshot_pages(),
-        };
+        }
+    }
+
+    /// Write a save state (lz4-compressed). Returns the compressed size in bytes.
+    pub fn save_state(&mut self, path: &std::path::Path) -> std::io::Result<u64> {
+        self.par_join();
+        self.cp_join();
+        // GPU writes still in flight (resolve copies, deferred fence writes) belong in the state
+        self.gpu.fence(&mut self.mem);
+        let snap = self.snapshot();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -2512,10 +2561,13 @@ impl Machine {
     }
 
     fn write_state(&self, path: &std::path::Path, snap: &Snapshot) -> std::io::Result<()> {
-        use std::io::Write;
-        let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-        let mut enc = lz4_flex::frame::FrameEncoder::new(file);
-        bincode::serialize_into(&mut enc, snap).map_err(std::io::Error::other)?;
+        write_snapshot(path, snap, &self.state_tail()?)
+    }
+
+    /// The fields appended after the snapshot, serialized: small, so a background save (the black
+    /// box) takes them on the game thread and leaves only the pages' compression to its thread.
+    fn state_tail(&self) -> std::io::Result<Vec<u8>> {
+        let mut enc = Vec::new();
         // guest time (#56), appended so older builds and older states still load
         bincode::serialize_into(&mut enc, &self.now()).map_err(std::io::Error::other)?;
         // physical allocator state (#60), appended the same way
@@ -2535,10 +2587,33 @@ impl Machine {
         // were freed. They are in the free list above too (older builds reuse them at once); a
         // state that resumed with them free handed them out early and the match diverged.
         bincode::serialize_into(&mut enc, &self.phys_quarantine).map_err(std::io::Error::other)?;
-        // flush explicitly: a dropped BufWriter swallows its last write error
-        let mut file = enc.finish().map_err(std::io::Error::other)?;
-        file.flush()?;
-        file.get_ref().sync_all()
+        Ok(enc)
+    }
+
+    /// `save_state` with the file written on another thread (the black box saves one every few
+    /// minutes; a full save stalls the game ~3 s, mostly lz4 and the disk). The game thread only
+    /// copies the pages. The thread returns the state's size.
+    pub fn save_state_background(&mut self, path: std::path::PathBuf) -> std::thread::JoinHandle<std::io::Result<u64>> {
+        self.par_join();
+        self.cp_join();
+        self.gpu.fence(&mut self.mem);
+        let snap = self.snapshot();
+        let tail = self.state_tail();
+        std::thread::spawn(move || {
+            let tail = tail?;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut tmp = path.as_os_str().to_owned();
+            tmp.push(".tmp");
+            let tmp = std::path::PathBuf::from(tmp);
+            let done = write_snapshot(&tmp, &snap, &tail).and_then(|_| std::fs::rename(&tmp, &path));
+            if done.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            done?;
+            Ok(std::fs::metadata(&path)?.len())
+        })
     }
 
     /// Resume from a save state written by `save_state` for the same default.xex.
@@ -2617,7 +2692,7 @@ impl Machine {
             self.audio.next_frame = shift(self.audio.next_frame);
             for th in &mut self.threads {
                 match &mut th.state {
-                    State::Waiting(Wait::Sleep(d)) | State::Waiting(Wait::Nap(d)) | State::Waiting(Wait::Objects { deadline: Some(d), .. }) => *d = shift(*d),
+                    State::Waiting(Wait::Sleep(d)) | State::Waiting(Wait::Nap(d)) | State::Waiting(Wait::Objects { deadline: Some(d), .. }) | State::Waiting(Wait::GpuMoved { deadline: d, .. }) => *d = shift(*d),
                     _ => {}
                 }
             }
@@ -2678,7 +2753,7 @@ mod tests {
     }
 
     fn machine() -> Machine {
-        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false };
+        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false, resources: vec![] };
         let dir = std::env::temp_dir();
         Machine::new(&x, &dir, &dir)
     }

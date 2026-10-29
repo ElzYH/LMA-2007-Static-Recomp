@@ -1538,3 +1538,11 @@ mod tests {
         assert_eq!(run(true), (regs, mirror, dirty), "wrapping the ring: the same result");
     }
 }
+
+/// LMA_RES_SCALE=<n> (1-4, default 1): EDRAM surfaces, the resolves kept on the GPU and the
+/// present have n x n texels per guest pixel, so 3D draws render above 720p; the guest still sees
+/// 1280x720 and guest memory gets 1x resolves (#797).
+pub fn res_scale() -> u32 {
+    static S: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("LMA_RES_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 4))
+}

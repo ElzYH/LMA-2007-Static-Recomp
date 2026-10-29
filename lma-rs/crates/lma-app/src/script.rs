@@ -44,6 +44,8 @@ pub enum Cmd {
     Turbo(Option<bool>),
     Port(usize),
     Status,
+    /// A bug report, as F12 / Ctrl+B.
+    Report,
     Quit,
 }
 
@@ -103,6 +105,7 @@ pub fn parse(line: &str) -> Result<Option<Cmd>, String> {
             _ => return Err("port takes 1 to 4".into()),
         },
         "status" => Cmd::Status,
+        "report" => Cmd::Report,
         "quit" | "exit" => Cmd::Quit,
         v => return Err(format!("unknown command: {v}")),
     };
@@ -357,6 +360,12 @@ mod tests {
         let (w, h, out) = shrink(4, 2, &px, 2);
         assert_eq!((w, h), (2, 1));
         assert_eq!(out, vec![127, 127, 127, 255, 200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn report_is_a_command() {
+        assert!(matches!(parse("report"), Ok(Some(Cmd::Report))));
+        assert!(matches!(parse("  REPORT  # the black box"), Ok(Some(Cmd::Report))));
     }
 
     #[test]

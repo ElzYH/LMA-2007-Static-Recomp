@@ -81,6 +81,8 @@ category, LT/RT the sub-screen (FINANCE > RT x4 = Player Contracts; RECORDS > RT
 Champions; LT/RT exist in scripts since #309, so a main build, not the stable 4aaeaa6 play build). Team select starts on a random club in a fresh profile: step with RIGHT and read
 the row (`tools/live_drive.sh cap`) rather than counting presses.
 
+The black box (lma-app, the maintainer 29 Oct): every `LMA_BLACKBOX=<min>` minutes (default 3, 0 = off) a state saved in the background (~0.2 s on the game thread) and the pad's presses from there go to `reports/.blackbox/` (the last two kept); a bug report (F12 / Ctrl+B) gets them as `before.state` + `before.input` (replay: `LMA_LOAD=before.state LMA_INPUT=@before.input`) and `events.txt` (`runtime::events`: every sound started, by bank/cue name). A sound started 6 times in 10 s writes a report by itself, once a session. lma-cli: `LMA_EVENTS=<file>` writes the event log at exit, `LMA_SAVE_BG=1` saves `LMA_SAVE` the black box's way.
+
 Scripted headless testing: `LMA_INPUT="4900:10:100,5300:2:8"` (at M instr : hex buttons : length
 M instr, and an optional `:port` 1-4 for another controller, lma-cli only, #693), `LMA_FRAMES=4400` dumps frames, `LMA_RENDER_EVERY=10` skips frames. `LMA_SKIP_LAND=<hex dest,...>|all|0` keeps those resolves on the GPU with no read-back into
 guest memory (#864: identical frames on 12 states through a whole match, fingerprints unchanged, no fps change: the GPU cost is
@@ -92,6 +94,12 @@ lma-app does (the threaded backend throttles the game per frame only there).
 In the live window `LMA_FRAME_DIR=<dir>` writes every presented frame at a quarter size
 (`<guest frame>.png`), to find one-frame flashes (#205): `tools/flash_detect.py <dir>` lists
 frames where the players turn darker or brighter for exactly one frame.
+
+The app's icon is LMA's own, the title icon in the player's default.xex (`xex::Xex::title_icon_png`,
+read at run time: window icon, and the Dock icon on macOS; `lma-cli xex-icon <xex> <out.png>` for a
+local bundle's .icns; #841). While the window can't be seen (minimised, covered, another Space) the
+game and its sound run on but nothing is drawn, and Bevy's loop runs 4 times a second (#841:
+drawing is ~65% of a match's CPU).
 
 Profiling (#6): `LMA_FRAME_PROFILE=1 lma-app ...` logs every 2 s where each guest frame's wall
 time goes: game thread (guest code, kernel, command processor and its waits, sleep), render
@@ -187,7 +195,8 @@ with 4 threads; the game only uses its day-update worker threads there, so measu
 the driver, not lma-cli's instruction-timed presses (they never start the update in real time).
 Default only after a full-season comparison (the maintainer's condition).
 
-Fence nap (#312, #502; on by default since #861, `LMA_FENCE_NAP=0` spins as before): the title screen and menus spin the game
+Fence nap and wait (#312, #502, #810; the native wait is on by default in real time, `LMA_FENCE_NAP=0`
+off): the title screen and menus spin the game
 thread in D3D's fence waits (the watchdog 0x82339080 polled with no sleep: 100% of a core). The hook
 on the watchdog sleeps the thread 0.25 ms (`hooks::FENCE_NAP_TICKS`) on every other poll with an
 unmoved GPU read pointer: title 96% -> 39% CPU, menu 100% -> 42%, 60 fps kept; in matches the day
@@ -201,7 +210,11 @@ for hooks that sleep: they set `Machine::nap_until` and the dispatcher parks the
 resumes at the hooked address, so the hook must let the function run between naps or the caller's
 own exit test never runs. With the hook installed the real-time idle loop returns to lma-app as soon
 as a frame was presented. `LMA_FENCE_NAP=2` installs the hook without napping, `LMA_FENCE_NAP_LOG=1`
-logs every 5000th poll. Test scheduler changes live: the headless deterministic run hid two of the
+logs every 5000th poll. `LMA_FENCE_NAP=wait`, the default in real time (unset; deterministic runs install no hook, so their
+fingerprints are unchanged), is the native wait instead of a timed nap:
+the thread parks on its second unmoved poll as `Wait::GpuMoved` and wakes the moment the GPU writes its
+fence or moves its read pointer (at most 0.25 ms later anyway), so a match's fences, which land at the
+next command-processor run, cost no oversleep; deterministic runs spin as without the hook. Test scheduler changes live: the headless deterministic run hid two of the
 three bugs the first build had (LESSONS).
 
 Native player overall (#595, on by default, `LMA_NATIVE_OVERALL=0` off): the day update's top guest
@@ -910,6 +923,18 @@ Shape of the generated code (#6 rework), each switch read by `lma-recomp` when i
 - A `bl` to a function in the same part crate is a direct Rust call (`call_local`), and a branch
   into another function's start enters it with `call` (#146, #164; on by default since #334).
   `LMA_RECOMP_V2=0` turns both off. Import thunks and hooked functions stay on the table.
+- The IR emitter (#145 M1, `LMA_RECOMP_IR=1`): each instruction is decoded into an `Op` with the
+  registers it reads and writes (`recomp/src/ir.rs`; `live.rs` has the blocks, gen/kill and
+  liveness), and a block is emitted over host locals (`emit.rs`): the registers it reads are
+  loaded once at entry, the integer ops compute on the locals through `guest::native` (value
+  functions with the interpreter's exact semantics), helpers get the locals they read stored
+  before and the ones they write reloaded after, and every exit (the budget checks between
+  leaders, the tail) stores back what was written, so `Cpu` is exact wherever anything else
+  can look (dispatcher, calls, helpers, the interpreter, save states). Budget counts, check
+  points and the schedule are unchanged. Property tests pin the IR to the interpreter: nothing
+  outside an op's defs changes and nothing outside its uses matters
+  (`ir::tests::ops_touch_what_the_interpreter_touches`), and the native evaluator leaves the
+  interpreter's registers and memory (`native_eval_matches_the_interpreter`).
 - Tried and not kept (9 Oct, branches kept): direct calls across part crates via `#[no_mangle]`
   and `extern "Rust"` (`mac/cross-crate-calls`, -0.5%: `rec::call`'s cost is its bookkeeping, not
   the lookup), a timebase computed on read (`mac/lazy-timebase`, no time gain), and broad guest

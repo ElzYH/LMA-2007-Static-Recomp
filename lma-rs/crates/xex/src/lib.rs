@@ -14,6 +14,7 @@ const FILE_FORMAT_INFO: u32 = 0x0000_03FF;
 const ENTRY_POINT: u32 = 0x0001_0100;
 const IMAGE_BASE: u32 = 0x0001_0201;
 const IMPORT_LIBRARIES: u32 = 0x0001_03FF;
+const RESOURCE_INFO: u32 = 0x0000_02FF;
 
 #[derive(Debug)]
 pub struct Error(pub String);
@@ -54,6 +55,15 @@ pub struct Import {
     pub kind: u8,
 }
 
+/// A resource the XEX carries (optional header 0x2FF): a name (the title id, for the title's
+/// own XDBF data) and where its bytes are in the image.
+#[derive(Debug, Clone)]
+pub struct Resource {
+    pub name: String,
+    pub address: u32,
+    pub size: u32,
+}
+
 #[derive(Debug)]
 pub struct Xex {
     pub module_flags: u32,
@@ -62,6 +72,7 @@ pub struct Xex {
     pub image: Vec<u8>,
     pub libraries: Vec<ImportLibrary>,
     pub used_devkit_key: bool,
+    pub resources: Vec<Resource>,
 }
 
 impl Xex {
@@ -110,7 +121,8 @@ impl Xex {
             Some(o) => parse_imports(d, o as usize)?,
             None => Vec::new(),
         };
-        Ok(Self { module_flags, entry_point, image_base, image, libraries, used_devkit_key })
+        let resources = opt(RESOURCE_INFO).map(|o| parse_resources(d, o as usize)).unwrap_or_default();
+        Ok(Self { module_flags, entry_point, image_base, image, libraries, used_devkit_key, resources })
     }
 
     /// Byte at guest address `addr`.
@@ -230,6 +242,63 @@ fn parse_imports(d: &[u8], o: usize) -> Result<Vec<ImportLibrary>, Error> {
     Ok(libs)
 }
 
+impl Xex {
+    /// A resource's bytes in the image (None when it lies outside it).
+    pub fn resource_bytes(&self, r: &Resource) -> Option<&[u8]> {
+        let at = r.address.checked_sub(self.image_base)? as usize;
+        self.image.get(at..at.checked_add(r.size as usize)?)
+    }
+
+    /// The title's own icon, a PNG: the image 0x8000 of the title's XDBF resource (its SPA data),
+    /// what the dashboard shows for the game. Read from the player's own disc at run time; nothing
+    /// of it ships with the port (the maintainer, 26 Oct: "the icon from LMA, don't generate one").
+    pub fn title_icon_png(&self) -> Option<&[u8]> {
+        self.resources.iter().filter_map(|r| self.resource_bytes(r)).find_map(|d| xdbf_entry(d, XDBF_IMAGES, XDBF_TITLE_IMAGE))
+    }
+}
+
+/// XDBF namespaces and ids (the SPA format): images, and the title's own image among them.
+pub const XDBF_IMAGES: u16 = 2;
+pub const XDBF_TITLE_IMAGE: u64 = 0x8000;
+
+/// Entry `id` of `namespace` in an XDBF blob (big-endian: "XDBF", version, entry table length,
+/// entry count, free table length, free count; 18-byte entries of namespace u16, id u64, offset
+/// u32, length u32; the data after the entry and free tables). None when it's not there or out
+/// of bounds.
+pub fn xdbf_entry(d: &[u8], namespace: u16, id: u64) -> Option<&[u8]> {
+    if d.get(..4)? != b"XDBF" {
+        return None;
+    }
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_be_bytes(b.try_into().unwrap()));
+    let (table_len, count, free_len) = (u32_at(8)? as usize, u32_at(12)? as usize, u32_at(16)? as usize);
+    let data = 24usize.checked_add(table_len.checked_mul(18)?)?.checked_add(free_len.checked_mul(8)?)?;
+    (0..count.min(table_len)).find_map(|i| {
+        let e = d.get(24 + i * 18..24 + i * 18 + 18)?;
+        let ns = u16::from_be_bytes([e[0], e[1]]);
+        let eid = u64::from_be_bytes(e[2..10].try_into().unwrap());
+        if ns != namespace || eid != id {
+            return None;
+        }
+        let off = u32::from_be_bytes(e[10..14].try_into().unwrap()) as usize;
+        let len = u32::from_be_bytes(e[14..18].try_into().unwrap()) as usize;
+        d.get(data.checked_add(off)?..data.checked_add(off)?.checked_add(len)?)
+    })
+}
+
+/// The resource table (optional header 0x2FF): its size, then 16-byte entries (name[8], address,
+/// size). Out-of-range entries are dropped.
+fn parse_resources(d: &[u8], at: usize) -> Vec<Resource> {
+    let Some(size) = d.get(at..at + 4).map(|b| u32::from_be_bytes(b.try_into().unwrap()) as usize) else { return Vec::new() };
+    // the count from the file, capped by what the file can hold (a damaged size isn't billions of tries)
+    (0..(size.saturating_sub(4) / 16).min(d.len().saturating_sub(at + 4) / 16))
+        .filter_map(|i| {
+            let e = d.get(at + 4 + i * 16..at + 4 + i * 16 + 16)?;
+            let name = String::from_utf8_lossy(&e[..8]).trim_end_matches('\0').to_string();
+            Some(Resource { name, address: u32::from_be_bytes(e[8..12].try_into().unwrap()), size: u32::from_be_bytes(e[12..16].try_into().unwrap()) })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +402,39 @@ mod tests {
         let mut not_pe = image();
         not_pe[0] = b'Z';
         assert!(Xex::parse(&xex(&not_pe, 0, 0, &[], [0; 16])).is_err());
+    }
+
+    /// An XDBF blob's entry by namespace and id, bounded by the blob.
+    #[test]
+    fn xdbf_finds_the_title_image() {
+        let png = b"\x89PNG fake";
+        let mut d = b"XDBF".to_vec();
+        for v in [0x10000u32, 2, 2, 0, 0] {
+            d.extend_from_slice(&v.to_be_bytes());
+        }
+        // entry 0: a string (namespace 3); entry 1: the title image
+        d.extend_from_slice(&3u16.to_be_bytes());
+        d.extend_from_slice(&1u64.to_be_bytes());
+        d.extend_from_slice(&0u32.to_be_bytes());
+        d.extend_from_slice(&2u32.to_be_bytes());
+        d.extend_from_slice(&XDBF_IMAGES.to_be_bytes());
+        d.extend_from_slice(&XDBF_TITLE_IMAGE.to_be_bytes());
+        d.extend_from_slice(&2u32.to_be_bytes());
+        d.extend_from_slice(&(png.len() as u32).to_be_bytes());
+        d.extend_from_slice(b"hi");
+        d.extend_from_slice(png);
+        assert_eq!(xdbf_entry(&d, XDBF_IMAGES, XDBF_TITLE_IMAGE), Some(&png[..]));
+        assert_eq!(xdbf_entry(&d, XDBF_IMAGES, 0x8001), None);
+        assert_eq!(xdbf_entry(&d[..d.len() - 1], XDBF_IMAGES, XDBF_TITLE_IMAGE), None, "out of bounds");
+        assert_eq!(xdbf_entry(b"nope", 2, 0x8000), None);
+    }
+
+    /// With the player's own default.xex (LMA_XEX): its title icon is a PNG.
+    #[test]
+    fn the_games_title_icon_is_a_png() {
+        let Some(path) = std::env::var_os("LMA_XEX") else { return };
+        let x = Xex::parse(&std::fs::read(path).unwrap()).unwrap();
+        let png = x.title_icon_png().expect("a title icon");
+        assert_eq!(&png[..4], b"\x89PNG", "{:?}", x.resources);
     }
 }

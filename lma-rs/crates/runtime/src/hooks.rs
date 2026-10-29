@@ -67,19 +67,42 @@ pub const CONTRACT_SET: u32 = 0x8211_C658;
 /// `wait_for_fence(device, fence)` at 0x82335380 loops `while watchdog(&s) && *(ring + 0x3c) < fence`
 /// with no sleep, and the watchdog only times the wait out after 5000 ticks; `s[0]` is the device
 /// block, `device + 0x2a10` its ring, `ring + 0x3c` the GPU's read pointer. On the 360 that spin
-/// lasts microseconds; here it burns a core at the title screen (100% CPU, menus too). The hook
-/// (on by default since #861; LMA_FENCE_NAP=0 keeps the spin) lets the watchdog run but, when the
-/// read pointer has not moved since `FENCE_NAP_AFTER` polls of the same thread, puts the thread to
-/// sleep for `FENCE_NAP_TICKS` on every other poll.
+/// lasts microseconds; here it burns a core at the title screen (100% CPU, menus too). With
+/// LMA_FENCE_NAP=1 the hook lets the watchdog run but, when the read pointer has not moved since
+/// `FENCE_NAP_AFTER` polls of the same thread, puts the thread to sleep for `FENCE_NAP_TICKS` on
+/// every other poll.
 pub const FENCE_WATCHDOG: u32 = 0x8233_9080;
-/// The nap between two polls of an unmoved fence: 0.25 ms of the 50 MHz timebase.
-pub const FENCE_NAP_TICKS: u64 = 12_500;
+/// The nap between two polls of an unmoved fence: 1 ms of the 50 MHz timebase. The GPU moving the
+/// fence ends it early (wait mode); quiet inbox, game thread: 26-29% of a core at 0.25 ms, 21-25%
+/// at 1 ms, night match fps unchanged (#312).
+pub const FENCE_NAP_TICKS: u64 = 50_000;
 /// Unmoved polls before the first nap. A poll is ~115 guest instructions (~50 ns here), so 2,000
 /// of them are ~0.1 ms of spinning: the fences of a running match land within that and never nap
 /// (one A/B round of the first version, napping from the second poll, cut the day match's 1% lows
 /// 57 -> 33 fps), while the title screen's and the menus' waits last a frame or more and still
 /// sleep through nearly all of it.
 pub const FENCE_NAP_AFTER: u32 = 2_000;
+/// LMA_FENCE_NAP=wait (real time only; deterministic runs spin as without the hook, so their
+/// instruction counts and fingerprints stay): the thread parks on the second unmoved poll and every
+/// other one after (`Wait::GpuMoved`), woken by the fence or read pointer moving, so a fence that
+/// lands at the next command-processor run costs no oversleep. The polls in between let the
+/// caller's own exit test run.
+pub const FENCE_WAIT_AFTER: u32 = 2;
+
+/// The fence hook's mode from LMA_FENCE_NAP: `1` the timed nap, `2` observe only, `wait` the native
+/// wait (3), `0` no hook. Unset is the native wait in real time (mac-perf's day-match rounds on #810:
+/// ~59 fps with 20-35% less CPU, the best 1% lows) and no hook in deterministic runs, so their
+/// instruction counts and fingerprints stay as they were.
+pub fn fence_nap_mode(env: Option<&str>, deterministic: bool) -> Option<u8> {
+    match env {
+        Some("0") => None,
+        Some("1") => Some(1),
+        Some("wait") => Some(3),
+        Some(_) => Some(2),
+        None if deterministic => None,
+        None => Some(3),
+    }
+}
 /// The players' runtime records (0x12c bytes each; the database record first, stored value at +0x14).
 const PLAYER_TABLE: u32 = 0x8274_06C8;
 /// The club's starting funds, `funds(club uid) -> GBP` (r3): tier word x 10 x the club's group
@@ -93,25 +116,11 @@ const CLUB_UID_MAP: u32 = 0x8273_D6C8;
 /// direct calls off them (`guest::hooks`, #165). New hooks are added there.
 pub use guest::hooks::ADDRESSES;
 
-/// LMA_FENCE_NAP: 1 naps (the default since #861: on a quiet Mac the night match's game thread went
-/// from 100% to 66% of a core at the same 60 fps and 1% lows), 0 spins as the 360 did, 2 installs
-/// the hook without napping (debug). Anything else counts as 1.
-pub fn fence_nap_mode() -> u8 {
-    fence_nap_mode_of(std::env::var("LMA_FENCE_NAP").ok().as_deref())
-}
-
-fn fence_nap_mode_of(var: Option<&str>) -> u8 {
-    match var {
-        Some("0") => 0,
-        Some("2") => 2,
-        _ => 1,
-    }
-}
-
 /// The hooks to install for this run.
 pub fn installed() -> Vec<(u32, Hook)> {
     let mut out: Vec<(u32, Hook)> = Vec::new();
-    if fence_nap_mode() != 0 {
+    let deterministic = std::env::var("LMA_DETERMINISTIC").is_ok_and(|v| v != "0");
+    if fence_nap_mode(std::env::var("LMA_FENCE_NAP").ok().as_deref(), deterministic).is_some() {
         out.push((FENCE_WATCHDOG, fence_watchdog as Hook));
     }
     // `count` only counts the calls (the game's function still runs): the work-based A/B's baseline;
@@ -181,16 +190,20 @@ pub fn fence_watchdog(m: &mut Machine) -> bool {
     let rd = m.mem.read32(ring + 0x3c);
     let cur = m.cur;
     let last = m.fence_polls.get(&cur).copied().unwrap_or((rd.wrapping_add(1), 0));
+    // LMA_FENCE_NAP=2 (debug): the hook observes and logs but never naps
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| fence_nap_mode(std::env::var("LMA_FENCE_NAP").ok().as_deref(), false).unwrap_or(2));
+    let wait = mode == 3 && !m.deterministic;
     let (after, ticks) = fence_nap_config();
-    let (next, nap) = fence_nap_after(last, rd, after);
+    let (next, nap) = fence_nap_after(last, rd, if wait { FENCE_WAIT_AFTER } else { after });
     m.fence_polls.insert(cur, next);
-    // LMA_FENCE_NAP=2 (debug): the hook observes and logs but never naps. A deterministic run naps
-    // only when asked (LMA_FENCE_NAP=1): a nap moves its clock, so the default would move the
-    // fingerprints (#861).
-    static NAP_ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-    let (on, explicit) = *NAP_ON.get_or_init(|| (fence_nap_mode() == 1, std::env::var_os("LMA_FENCE_NAP").is_some()));
-    if nap && on && (explicit || !m.deterministic) {
+    if nap && (mode == 1 || wait) {
         m.nap_until = Some(m.now() + ticks);
+        if wait {
+            // the native wait: parked until the GPU writes its fence or moves its read pointer
+            // (the command processor runs as soon as this slice ends), the nap only a bound
+            m.nap_watch = Some(([ring, ring + 0x3c], [m.mem.read32(ring), rd]));
+        }
     }
     // LMA_FENCE_NAP_LOG=1 (debug): every poll's decision
     static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -567,6 +580,42 @@ pub fn wage_round_block_for(game: guest::rec::FuncFn) -> guest::rec::FuncFn {
 }
 
 static AI_OFFER_GAME: std::sync::OnceLock<guest::rec::FuncFn> = std::sync::OnceLock::new();
+
+/// The wage from a player's rating, `rating_wage(r3, player r4) -> wage` (0x82120d38): a 10-step
+/// table by rating (2..480, immediates) x (club tier x 15 + rating), by contract kind and nation,
+/// rounded (`WAGE_ROUND`), then capped by league status and kind (`0x820055a8`, 60k-80k a week at
+/// the top) and rounded again. A new player's wage (`WAGE`), his demands and `AI_OFFER` start here.
+pub const RATING_WAGE: u32 = 0x8212_0D38;
+
+/// Mod `rating_wage_scale` x 1000 (1000 = the game's own, no block).
+pub static RATING_WAGE_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+static RATING_WAGE_GAME: std::sync::OnceLock<guest::rec::FuncFn> = std::sync::OnceLock::new();
+
+/// The `RATING_WAGE` block for `rating_wage_scale`: the game's wage x the scale, rounded with
+/// `round_wage` (capped at `WAGE_MAX` with `ai_wage_offers`, else at the game's 250,000).
+pub fn rating_wage_block_for(game: guest::rec::FuncFn) -> guest::rec::FuncFn {
+    let _ = RATING_WAGE_GAME.set(game);
+    rating_wage_block
+}
+
+/// `wage` x `scale` / 1000, rounded as the game rounds a wage and capped at `cap`.
+pub fn scale_rating_wage(mem: &mut guest::mem::Memory, wage: u32, scale: u32, cap: u32) -> u32 {
+    round_wage(mem, (wage as u64 * scale as u64 / 1000).min(cap as u64) as u32, cap)
+}
+
+fn rating_wage_block(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, pc: u32, b: &mut i64) -> Result<u32, guest::cpu::Stop> {
+    let lr = c.lr as u32 & !3;
+    let Some(game) = RATING_WAGE_GAME.get() else { unreachable!("rating_wage_block is only installed through rating_wage_block_for") };
+    let next = call_to_the_end(c, m, pc, b, *game)?;
+    if next != lr {
+        return Ok(next); // something inside unwound: the game's answer stands
+    }
+    let scale = RATING_WAGE_SCALE.load(std::sync::atomic::Ordering::Relaxed);
+    let cap = if AI_WAGE_OFFERS.load(std::sync::atomic::Ordering::Relaxed) { WAGE_MAX } else { 250_000 };
+    c.gpr[3] = scale_rating_wage(m, c.gpr[3] as u32, scale, cap) as u64;
+    Ok(lr)
+}
 
 /// The `AI_OFFER` block for `ai_wage_offers`: the game's offer, raised to the player's wage now
 /// (the wage getter, so wages.csv's) + 10%, rounded with `round_wage`.
@@ -1153,20 +1202,9 @@ pub fn search_rejects(mem: &mut guest::mem::Memory, entry: u32, criteria: u32) -
     if club >= 1 {
         // the club's runtime record by uid, as 0x820e3e68 and 0x820e95c0 find it (address 0 when
         // the uid is out of range or unmapped)
-        let map = mem.read32(CLUB_UID_MAP);
-        let index = if (club as u32).wrapping_sub(1) < 0x2056 { mem.read16(map.wrapping_add(club as u32 * 2)) as i16 } else { -1 };
-        let records = mem.read32(CLUB_RECORDS);
-        let mapped = (0..0x708).contains(&index);
-        let club_rec = if mapped { records.wrapping_add(index as u32 * 0x3d8) } else { 0 };
-        // its country must be wanted (criteria + (country + 10) x 4 non-zero): the country of the
-        // club's stadium, as 0x820e4798 -> 0x8212e168 find it (0x33 for an unmapped club)
-        let country = if mapped && club_rec != 0 {
-            let stadium = mem.read32(club_rec.wrapping_add(4)) >> 21;
-            let at = if stadium < 2000 { mem.read32(STADIUM_RECORDS).wrapping_add(stadium * 0x20 + 0xc) } else { 0xc };
-            (mem.read32(at) >> 15) & 0x3f
-        } else {
-            0x33
-        };
+        let club_rec = club_record(mem, club as u32);
+        // its country must be wanted (criteria + (country + 10) x 4 non-zero)
+        let country = club_country(mem, club as u32);
         if mem.read32(criteria.wrapping_add((country + 10) * 4)) == 0 {
             return true;
         }
@@ -1212,6 +1250,25 @@ pub fn search_rejects(mem: &mut guest::mem::Memory, entry: u32, criteria: u32) -
 
 /// The stadium records (0x20 bytes each), read by 0x8212e168 for a club's country.
 const STADIUM_RECORDS: u32 = 0x8274_1278;
+
+/// A club's runtime record by uid, as 0x820e3e68 and 0x820e95c0 find it (0 when the uid is out of
+/// range or unmapped).
+fn club_record(mem: &mut guest::mem::Memory, uid: u32) -> u32 {
+    let map = mem.read32(CLUB_UID_MAP);
+    let index = if uid.wrapping_sub(1) < 0x2056 { mem.read16(map.wrapping_add(uid * 2)) as i16 } else { -1 };
+    if (0..0x708).contains(&index) { mem.read32(CLUB_RECORDS).wrapping_add(index as u32 * 0x3d8) } else { 0 }
+}
+
+/// A club's country: its stadium's, as 0x820e4798 -> 0x8212e168 find it (0x33 for an unmapped club).
+fn club_country(mem: &mut guest::mem::Memory, uid: u32) -> u32 {
+    let rec = club_record(mem, uid);
+    if rec == 0 {
+        return 0x33;
+    }
+    let stadium = mem.read32(rec.wrapping_add(4)) >> 21;
+    let at = if stadium < 2000 { mem.read32(STADIUM_RECORDS).wrapping_add(stadium * 0x20 + 0xc) } else { 0xc };
+    (mem.read32(at) >> 15) & 0x3f
+}
 
 /// Peak age per position (u16 each, indexed by the record's first position x 2), read by 0x8211f878.
 const PEAK_AGES: u32 = 0x8200_556C;
@@ -1263,10 +1320,18 @@ pub const SLOT_LOOKUP: u32 = 0x8225_EDF0;
 /// The match builder, `build(G + 32, obj = G + 20640, ...)`: clears the match object and makes slots
 /// 0-15 from the pre-match squad entries 0-15 (`G + 5936 + team x 7296 + k x 228`).
 pub const MATCH_BUILD: u32 = 0x8225_BF10;
-/// The lookups that may swap a reserve in: 0x8226c130's of the player coming on, and the subs menu's
-/// confirm (0x82190130), which looks up both chosen players before it queues the request. The
-/// player going off is always in a slot, so only the incoming one can miss the scan.
-const SUB_LOOKUP_RETS: [u32; 3] = [0x8226_C1E0, 0x8219_01DC, 0x8219_01EC];
+/// The lookup that may swap a reserve in: 0x8226c130's of the player coming on (the substitution
+/// itself; the queue entry's first id). The player going off is always in a slot (0x8226c1e0), so
+/// only the incoming one can miss the scan; with 0x8226c1e0 here a queued reserve came on as an
+/// empty slot and the player going off was written to address 0 (#530).
+const SUB_LOOKUP_RETS: [u32; 1] = [0x8226_C1C0];
+/// The lookups that find a queued reserve where the subs menu queued him, his virtual slot
+/// (`slot_get`), never swapping anyone in: the menu's undo of a pending substitution (0x82190130,
+/// both players) and the cancel it calls (0x8226b9b8, both players). Swapping him in there made
+/// the undo find nothing to cancel (#530, the maintainer 28 Oct: "can't undo the sub before confirming it").
+const UNDO_LOOKUP_RETS: [u32; 4] = [0x8219_01DC, 0x8219_01EC, 0x8226_BA00, 0x8226_BA28];
+/// A slot's state (+996) while its player is queued to come on (the subs menu's pending substitution).
+const STATE_QUEUED: u32 = 6;
 const SLOTS_AT: u32 = 3008;
 const TEAM_STRIDE: u32 = 19408;
 const SLOT_SIZE: usize = 0x400;
@@ -1353,6 +1418,15 @@ pub fn slot_lookup(mem: &mut guest::mem::Memory, obj: u32, id: u32, swap_in: boo
     0
 }
 
+/// The slot a reserve's image starts from: the team's last bench slot holding a player. An empty
+/// one (id -1, no player injured or named) holds zeros where a player's slot has his team (+0x230,
+/// the substitution's counter of substitutions made: a reserve made from one came on uncounted, the
+/// count written at guest 0x4ba8, and the dugout listed the substitutions before his only, #530),
+/// floats of 1.0 and the bench state; slot 15 when the whole bench is empty.
+fn bench_template(mem: &mut guest::mem::Memory, obj: u32, team: u32) -> u32 {
+    (11..16).rev().map(|i| slot_at(obj, team, i)).find(|&s| mem.read32(s) != u32::MAX).unwrap_or_else(|| slot_at(obj, team, 15))
+}
+
 fn read_slot(mem: &mut guest::mem::Memory, s: u32) -> Vec<u8> {
     let mut v = vec![0u8; SLOT_SIZE];
     mem.read(s, &mut v);
@@ -1376,34 +1450,113 @@ fn bring_in(mem: &mut guest::mem::Memory, obj: u32, team: u32, id: u32, entry: O
         (Some(v), _) => v,
         (None, None) => return 0,
         (None, Some(entry)) => {
-            // as the builder makes a bench slot: an unused bench slot's image with the entry's id and
-            // its 220 bytes of player data twice (+8 and +228)
-            let template = target;
+            // as the builder makes a bench slot: a bench slot's image with the entry's id and its 220
+            // bytes of player data twice (+8 and +228)
+            let template = bench_template(mem, obj, team);
             let mut v = read_slot(mem, template);
             let mut data = [0u8; 220];
             mem.read(entry + 8, &mut data);
             v[0..4].copy_from_slice(&id.to_be_bytes());
             v[8..228].copy_from_slice(&data);
             v[228..448].copy_from_slice(&data);
-            // the unused slot's own state (0 or 2) and off the pitch
+            // a substitute's state (0 before kick-off, else 2) and off the pitch
+            let state = if mem.read32(slot_at(obj, team, 0) + SLOT_STATE as u32) == 0 { 0 } else { STATE_BENCH };
+            v[SLOT_STATE..SLOT_STATE + 4].copy_from_slice(&state.to_be_bytes());
             v[SLOT_ON_PITCH..SLOT_ON_PITCH + 4].fill(0);
             v
         }
     };
     let old = read_slot(mem, target);
-    // the slot keeps its own index (+4) and +28, as the swap 0x8226bf30 leaves them
-    image[4..8].copy_from_slice(&old[4..8]);
+    // the slot keeps +28, as the swap 0x8226bf30 leaves it, and its index (+4; an empty one holds 0)
+    let index = bench.iter().position(|&s| s == target).map_or(0, |k| 11 + k as u32);
+    image[4..8].copy_from_slice(&index.to_be_bytes());
     image[28..32].copy_from_slice(&old[28..32]);
-    // the unused substitute it displaces is kept, so he can still come on later
-    reserves.insert((team, word(&old, 0)), old);
+    // the unused substitute it displaces is kept, so he can still come on later (an empty slot: none)
+    if word(&old, 0) != u32::MAX {
+        reserves.insert((team, word(&old, 0)), old);
+    }
     mem.write(target, &image);
     target
+}
+
+/// A reserve's virtual slot: the one he is queued in (the menu has swapped his id off the reserve
+/// rows by then), else his row's (`slot_get`), or 0.
+pub fn reserve_slot(mem: &mut guest::mem::Memory, obj: u32, id: u32, extra: u32, virt: u32) -> u32 {
+    if extra == 0 || virt == 0 || id == u32::MAX {
+        return 0;
+    }
+    for team in 0..2 {
+        if !reserve_list(mem, obj, team, extra).iter().any(|&(r, _)| r == id) {
+            continue;
+        }
+        let queued = (0..VIRTUAL_PER_TEAM)
+            .map(|k| virt + (team * VIRTUAL_PER_TEAM + k) * SLOT_SIZE as u32)
+            .find(|&v| mem.read32(v) == id && mem.read32(v + SLOT_STATE as u32) == STATE_QUEUED);
+        if let Some(v) = queued {
+            return v;
+        }
+        if let Some(i) = (16..16 + VIRTUAL_ROWS).find(|&i| row_player(mem, obj, team, i, extra).is_some_and(|(r, _)| r == id)) {
+            return slot_get(mem, obj, team, i, extra, virt);
+        }
+    }
+    0
+}
+
+/// The subs menu's id for each of its rows, i16 by the row's slot index (-1 none), at `*0x8274cc08`:
+/// the menu finds its selection and cursor rows again by these ids (0x821903A0), and the X queues
+/// the player of the cursor row's slot (0x82190ff8 -> 0x8226b920).
+const MENU_ROW_IDS: u32 = 0x8274_CC08;
+
+/// Who virtual row `i` (16..) holds, as (id, pre-match entry or 0 for a displaced substitute): on the
+/// team the screen shows, the reserve with the menu's own id for the row (none if that player can't
+/// come on), so the screen, the menu's selection and the queue name the same player (#530: every
+/// queued substitution brought on the last reserve row's player, whatever row the cursor was on);
+/// else `reserve_list`'s order.
+fn row_player(mem: &mut guest::mem::Memory, obj: u32, team: u32, i: u32, extra: u32) -> Option<(u32, u32)> {
+    let ids = mem.read32(MENU_ROW_IDS);
+    if ids != 0 && mem.read32(TEAM_SCREEN_TEAM) == team {
+        let id = mem.read16(ids + 2 * i) as i16;
+        return (id >= 0).then(|| reserve_list(mem, obj, team, extra).into_iter().find(|&(r, _)| r == id as u32)).flatten();
+    }
+    reserve_list(mem, obj, team, extra).get((i - 16) as usize).copied()
+}
+
+/// The rows past 16 a team screen needs for `team`'s reserves: up to the menu's last row holding one
+/// (its table also lists injured players, who can't come on, so a reserve can sit past row 16 +
+/// `extra`: 276 at row 20 in the 24 Oct match), else one per reserve.
+/// A queued reserve's row counts too (the menu has swapped his id off it).
+fn reserve_rows(mem: &mut guest::mem::Memory, obj: u32, team: u32, extra: u32) -> u32 {
+    let list = reserve_list(mem, obj, team, extra);
+    let ids = mem.read32(MENU_ROW_IDS);
+    if ids != 0 && mem.read32(TEAM_SCREEN_TEAM) == team {
+        let mut last = (16..16 + VIRTUAL_ROWS).rev().find(|&i| {
+            let id = mem.read16(ids + 2 * i) as i16;
+            id >= 0 && list.iter().any(|&(r, _)| r == id as u32)
+        });
+        let virt = VIRTUAL_SLOTS.load(std::sync::atomic::Ordering::Relaxed);
+        for k in 0..VIRTUAL_PER_TEAM {
+            let v = virt + (team * VIRTUAL_PER_TEAM + k) * SLOT_SIZE as u32;
+            let row = mem.read32(v + 4);
+            if virt != 0 && mem.read32(v + SLOT_STATE as u32) == STATE_QUEUED && list.iter().any(|&(r, _)| r == mem.read32(v)) && (16..16 + VIRTUAL_ROWS).contains(&row) {
+                last = last.max(Some(row));
+            }
+        }
+        if let Some(i) = last {
+            return i - 15;
+        }
+    }
+    list.len() as u32
 }
 
 fn slot_lookup_block(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, _pc: u32, b: &mut i64) -> Result<u32, guest::cpu::Stop> {
     let lr = c.lr as u32 & !3;
     let extra = BENCH_EXTRA.load(std::sync::atomic::Ordering::Relaxed);
-    c.gpr[3] = slot_lookup(m, c.gpr[3] as u32, c.gpr[4] as u32, SUB_LOOKUP_RETS.contains(&lr), extra) as u64;
+    let (obj, id) = (c.gpr[3] as u32, c.gpr[4] as u32);
+    let mut s = slot_lookup(m, obj, id, SUB_LOOKUP_RETS.contains(&lr), extra);
+    if s == 0 && UNDO_LOOKUP_RETS.contains(&lr) {
+        s = reserve_slot(m, obj, id, extra, VIRTUAL_SLOTS.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    c.gpr[3] = s as u64;
     // about what the game's scan costs on average (3 instructions per slot, ~16 slots compared)
     *b -= 40;
     Ok(lr)
@@ -1416,6 +1569,11 @@ pub const SLOT_GET: u32 = 0x8225_EDC0;
 /// Guest memory for the reserves' virtual slots, 2 teams x 4 x 0x400 (`Machine::install_blocks`
 /// allocates it when `bench` > 5); 0 = none.
 pub static VIRTUAL_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// A team screen's rows past 16 (16..16 + this): room for the reserves behind injured players'
+/// rows. Each team has 4 virtual slots (`install_blocks`' 8 KB, part of every save state's small
+/// allocations since #661), one per reserve on a row, whatever the row.
+pub const VIRTUAL_ROWS: u32 = 16;
+const VIRTUAL_PER_TEAM: u32 = 4;
 
 /// The getter's answer with reserves (#530, the UI side's engine half): i = 16..16+extra of a team
 /// is a virtual slot at `virt` holding that reserve's image, the pre-match entry's (as `bring_in`
@@ -1430,16 +1588,34 @@ pub fn slot_get(mem: &mut guest::mem::Memory, obj: u32, team: u32, i: u32, extra
     if i < 16 {
         return slot_at(obj, team, i);
     }
-    if virt == 0 {
+    if virt == 0 || i >= 16 + VIRTUAL_ROWS {
         return 0;
     }
-    let Some(&(id, entry)) = reserve_list(mem, obj, team, extra).get((i - 16) as usize) else { return 0 };
-    let v = virt + (team * 4 + (i - 16)) * SLOT_SIZE as u32;
+    let list = reserve_list(mem, obj, team, extra);
+    let slots: Vec<u32> = (0..VIRTUAL_PER_TEAM).map(|k| virt + (team * VIRTUAL_PER_TEAM + k) * SLOT_SIZE as u32).collect();
+    // a reserve the subs menu queued keeps his slot as the menu left it (state 6 and its flags),
+    // so the menu can see the pending substitution and undo it (#530), until he comes on: the menu
+    // swaps the two players' ids in its own row table while the substitution waits, so the row's
+    // id is then the player going off; his slot remembers the row (+4)
+    let held = |mem: &mut guest::mem::Memory, v: u32| mem.read32(v + SLOT_STATE as u32) == STATE_QUEUED && list.iter().any(|&(r, _)| r == mem.read32(v));
+    if let Some(&v) = slots.iter().find(|&&v| held(mem, v) && mem.read32(v + 4) == i) {
+        return v;
+    }
+    let Some((id, entry)) = row_player(mem, obj, team, i, extra) else { return 0 };
+    // his own slot, else one whose player is no reserve any more, else one no queued reserve holds
+    // (there are at most 4 reserves)
+    let own = slots.iter().copied().find(|&v| mem.read32(v) == id);
+    let stale = || slots.iter().copied().find(|&v| !list.iter().any(|&(r, _)| r == mem.read32(v)));
+    let Some(v) = own.or_else(stale).or_else(|| slots.iter().copied().find(|&v| !held(mem, v))) else { return 0 };
+    if held(mem, v) {
+        return v;
+    }
     let stored = RESERVES.lock().unwrap().as_ref().and_then(|r| r.get(&(team, id)).cloned());
     // a substitute's state: 2 once the match is on (the goalkeeper's slot has 1), else 0
     let state = if mem.read32(slot_at(obj, team, 0) + SLOT_STATE as u32) == 0 { 0 } else { STATE_BENCH };
     let mut image = stored.unwrap_or_else(|| {
-        let mut v = read_slot(mem, slot_at(obj, team, 15));
+        let template = bench_template(mem, obj, team);
+        let mut v = read_slot(mem, template);
         let mut data = [0u8; 220];
         mem.read(entry + 8, &mut data);
         v[0..4].copy_from_slice(&id.to_be_bytes());
@@ -1488,7 +1664,7 @@ pub fn team_screen_rows(mem: &mut guest::mem::Memory, extra: u32) {
     if globals == 0 || team > 1 {
         return;
     }
-    let shown = reserve_list(mem, globals + OBJ_FROM_GLOBALS, team, extra).len() as u32;
+    let shown = reserve_rows(mem, globals + OBJ_FROM_GLOBALS, team, extra);
     for side in 0..2 {
         let a = TEAM_SCREEN_ROWS + side * 0x20;
         if mem.read32(a) == 16 {
@@ -1571,7 +1747,415 @@ pub fn match_build_block_for(game: guest::rec::FuncFn) -> guest::rec::FuncFn {
 
 fn match_build_block(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, pc: u32, b: &mut i64) -> Result<u32, guest::cpu::Stop> {
     *RESERVES.lock().unwrap() = None;
+    // no substitution queued in the last match carries over into this one's rows
+    let virt = VIRTUAL_SLOTS.load(std::sync::atomic::Ordering::Relaxed);
+    if virt != 0 {
+        m.write(virt, &[0u8; 2 * VIRTUAL_PER_TEAM as usize * SLOT_SIZE]);
+    }
     let Some(game) = MATCH_BUILD_GAME.get() else { unreachable!("match_build_block is only installed through match_build_block_for") };
+    game(c, m, pc, b)
+}
+
+/// The European Cup's draws (#703), `draw(competition << 32 | round, date)`: 0x821362b0 calls it
+/// on each of the diary's schedule entries for competition 0x37 and it switches on the round (2 the
+/// qualifying draw, 42 the 8 groups of 4 by 0x82134480, 9 the last 16, 0x1c/0x20/0x25 the rest).
+pub const EUROPEAN_CUP_DRAW: u32 = 0x8213_94A8;
+const LEAGUE_ROUND: u32 = 42;
+/// The straight entrants (16 uids, 0x8213abc8's copy of 0x8213a918's set) and the qualifying round's
+/// winners (16, collected by 0x8213a718 after round 3).
+const DIRECT_ENTRANTS: u32 = 0x8274_1520;
+const QUALIFIERS: u32 = 0x8274_14E0;
+/// The diary: [pointer, size] (the loader 0x822e5d48 sizes it from the file).
+const DIARY: u32 = 0x8274_0400;
+
+/// The league phase is on (the 2024+ European Cup; set with the diary's league-phase shape).
+pub static LEAGUE_PHASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Each league's European places in all (group stage + qualifying + UEFA Cup) and its table's top
+/// 10 uids, read just before the draw (`read_league_tables`): the clubs below the places refill the
+/// UEFA Cup slots the league phase's extras leave (`uefa_extras`).
+pub static LEAGUE_TABLES: std::sync::RwLock<[(u32, [u32; 10]); 8]> = std::sync::RwLock::new([(0, [0; 10]); 8]);
+
+/// The game's places record for a league, `places(nation, 0, record)` (0x82138b50): the hard-coded
+/// counts at `+0`, `+4`, `+8` and the table's top 10 at `+0x28` (see `EUROPE_PLACES`).
+const PLACES_RECORD: u32 = 0x8213_8B50;
+/// The return address `read_league_tables` gives the game's function: no code there, so `call`
+/// stops at it when the function returns.
+const CALL_RETURN: u32 = 4;
+/// The instructions the 8 places records may take (one is ~1,000-10,000).
+const PLACES_GRANT: i64 = 2_000_000;
+
+/// `LEAGUE_TABLES` from the game's places records of the 8 leagues, built in `record` (0x50 bytes)
+/// by calling 0x82138b50; the mod's `europe_places` counts replace the game's, as `europe_places`
+/// does. A league whose call doesn't come back keeps no table, nor do the ones after it (their
+/// extras' slots stay empty).
+fn read_league_tables(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, b: &mut i64, record: u32) -> Result<(), guest::cpu::Stop> {
+    let (gpr, lr) = (c.gpr, c.lr);
+    // a scheduling slice (20,000) is too short for the 8 records: the calls run on a grant that is
+    // charged back after them, as the hooks' own work is
+    *b += PLACES_GRANT;
+    let mut tables = [(0, [0; 10]); 8];
+    for (nation, table) in tables.iter_mut().enumerate() {
+        m.write(record, &[0; 0x50]);
+        c.gpr[3] = nation as u64;
+        c.gpr[4] = 0;
+        c.gpr[5] = record as u64;
+        c.lr = CALL_RETURN as u64;
+        let back = guest::rec::call(c, m, PLACES_RECORD, b);
+        if !matches!(back, Ok(CALL_RETURN)) {
+            eprintln!("league phase: no table for league {nation} and on");
+            back?;
+            break;
+        }
+        let places = EUROPE_PLACES_TABLE.read().unwrap().get(nation).map(|p| p.iter().sum()).unwrap_or_else(|| [0, 4, 8].iter().map(|&o| m.read32(record + o)).sum());
+        *table = (places, std::array::from_fn(|k| m.read32(record + 0x28 + 4 * k as u32)));
+    }
+    *b -= PLACES_GRANT;
+    (c.gpr, c.lr) = (gpr, lr);
+    *LEAGUE_TABLES.write().unwrap() = tables;
+    Ok(())
+}
+
+/// The 4 clubs the league phase takes beyond the game's 32 (uids), filled before its draw.
+pub static LEAGUE_EXTRAS: std::sync::RwLock<Vec<u32>> = std::sync::RwLock::new(Vec::new());
+
+/// The game's straight entrants and qualifiers, without empty slots (a career whose last season
+/// has no European Cup winner leaves the holder's slot at 0).
+fn entrant_sets(mem: &mut guest::mem::Memory) -> (Vec<u32>, Vec<u32>) {
+    let mut set = |at: u32| -> Vec<u32> { (0..16).map(|k| mem.read32(at + 4 * k)).filter(|&u| u != 0 && u != u32::MAX).collect() };
+    (set(DIRECT_ENTRANTS), set(QUALIFIERS))
+}
+
+/// The league phase's 36 entrants in pot order: the straight entrants (holders first, as the
+/// game's set has them), the extras, then the qualifiers; None unless all 36 are there, distinct.
+pub fn league_entrants(mem: &mut guest::mem::Memory, extras: &[u32]) -> Option<[u32; 36]> {
+    let (mut all, qualifiers) = entrant_sets(mem);
+    all.extend_from_slice(extras);
+    all.extend(qualifiers);
+    let mut seen = all.clone();
+    seen.sort_unstable();
+    seen.dedup();
+    if all.len() != 36 || seen.len() != 36 || all.iter().any(|&u| u == 0 || u == u32::MAX) {
+        return None;
+    }
+    all.try_into().ok()
+}
+
+/// The league phase's draw (`lma_data::league::draw`, seeded with `seed`) written into the game's
+/// diary, whose round-42 days `lma_data::diary::league_phase` shaped (8 of 18 blanks).
+pub fn league_phase_draw(mem: &mut guest::mem::Memory, seed: u64) -> Result<(), String> {
+    let mut extras = LEAGUE_EXTRAS.read().unwrap().clone();
+    let mut taken = Vec::new();
+    if extras.is_empty() {
+        // 4, and one more for each empty straight place (no holder)
+        let (direct, qualifiers) = entrant_sets(mem);
+        taken = uefa_extras(mem, 36usize.saturating_sub(direct.len() + qualifiers.len()));
+        extras = taken.iter().map(|&(_, u, _)| u).collect();
+    }
+    let clubs = league_entrants(mem, &extras).ok_or("not 36 distinct entrants")?;
+    let nations: [u16; 36] = std::array::from_fn(|k| club_country(mem, clubs[k]) as u16);
+    let days = lma_data::league::draw(&nations, seed).ok_or("no draw keeps the nation rules")?;
+    let days: Vec<Vec<(u16, u16)>> = days.iter().map(|d| d.iter().map(|&(h, a)| (clubs[h] as u16, clubs[a] as u16)).collect()).collect();
+    let (at, size) = (mem.read32(DIARY), mem.read32(DIARY + 4) as usize);
+    if at == 0 || size == 0 {
+        return Err("no diary".into());
+    }
+    let mut diary = vec![0u8; size];
+    mem.read(at, &mut diary);
+    lma_data::diary::fill_league_phase(&mut diary, guest::rec::base_year() as i32, &days).map_err(|e| e.to_string())?;
+    mem.write(at, &diary);
+    // the extras play in the league phase, not the UEFA Cup (its first round is drawn the next day):
+    // their leagues' next clubs take their places, so the UEFA Cup keeps its 80 and its groups 40
+    for (slot, uid, next) in taken {
+        mem.write32(slot, next);
+        eprintln!("league phase: {uid:#x} from the UEFA Cup, {next:#x} in its place");
+    }
+    Ok(())
+}
+
+/// The UEFA Cup's first-round entrants (64 uids, 0x8213a918's third set, copied by 0x8213abc8); the
+/// European Cup's round-42 draw comes the day before that round's draw in every disc season.
+const UEFA_FIRST_ROUND: u32 = 0x8274_13E0;
+
+/// The `n` extras (4, or more when a straight place is empty) for the league phase when the mod
+/// names none: the UEFA Cup's first-round set is in nation order with each nation's clubs by place,
+/// so the first club of each of its first `n` countries is that country's best-placed club below the European Cup's places. Returns (slot, uid,
+/// the club that takes the slot once the draw is in: the next in the uid's league table below its
+/// European places and in no European set, from `LEAGUE_TABLES`; 0, an empty slot, when none).
+fn uefa_extras(mem: &mut guest::mem::Memory, n: usize) -> Vec<(u32, u32, u32)> {
+    let mut out: Vec<(u32, u32, u32)> = Vec::new();
+    let mut countries = Vec::new();
+    for k in 0..64 {
+        let slot = UEFA_FIRST_ROUND + 4 * k;
+        let uid = mem.read32(slot);
+        if uid == 0 || uid == u32::MAX {
+            continue;
+        }
+        let country = club_country(mem, uid);
+        if !countries.contains(&country) {
+            countries.push(country);
+            out.push((slot, uid, 0));
+            if out.len() == n {
+                break;
+            }
+        }
+    }
+    // every European set of the season (0x8213abc8's): the UEFA Cup's group, first round and
+    // qualifier-loser sets, the thirds, and the European Cup's
+    let mut european: Vec<u32> = (0..(EUROPEAN_SETS_END - EUROPEAN_SETS) / 4).map(|k| mem.read32(EUROPEAN_SETS + 4 * k)).collect();
+    let tables = *LEAGUE_TABLES.read().unwrap();
+    for (_, uid, next) in out.iter_mut() {
+        let Some(&(places, top)) = tables.iter().find(|(_, top)| top.contains(uid)) else { continue };
+        let below = top.iter().position(|u| u == uid).unwrap_or(0).max(places as usize);
+        if let Some(&club) = top[below..].iter().find(|&&u| u != 0 && u != u32::MAX && !european.contains(&u)) {
+            *next = club;
+            european.push(club);
+        }
+    }
+    out
+}
+
+/// The season's European sets, `0x827412e0..0x827415e0` (cleared and filled by 0x8213abc8).
+const EUROPEAN_SETS: u32 = 0x8274_12E0;
+const EUROPEAN_SETS_END: u32 = 0x8274_15E0;
+
+/// The play-off's first-leg round (a two-legged pair, `lma_data::diary::PLAYOFF`) and the last 16's.
+const PLAYOFF_ROUND: u32 = lma_data::diary::PLAYOFF[0] as u32;
+const LAST_16_ROUND: u32 = 9;
+/// The game's knockout writer, `write(competition, round, list, shuffle)` (0x82134350): a list of
+/// clubs (word 0 the mode, 1 = consecutive (home, away) pairs; words 1.. the clubs; +0x404 the
+/// count), its first leg and then the second with home and away swapped.
+const KNOCKOUT_WRITER: u32 = 0x8213_4350;
+/// Guest memory for that list (0x408 bytes), allocated with the hook.
+pub static LEAGUE_LIST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// What the group stage leaves: the 8 thirds for the UEFA Cup's last 32 (0x82138780 reads them),
+/// the 8 winners (0x827414e0) and the 8 runners-up (0x82741500) for the last 16.
+const UEFA_THIRDS: u32 = 0x8274_1380;
+const RUNNERS_UP: u32 = 0x8274_1500;
+
+/// The league phase's clubs and table from the game's diary: the 36 uids in seeding order (as
+/// drawn: the order they first appear), and the table's order (`lma_data::league::table`), with
+/// how many of the 144 games are played. Recomputed from the diary each time, so a save state
+/// needs nothing else.
+pub fn league_order(mem: &mut guest::mem::Memory) -> Result<(Vec<u32>, usize), String> {
+    let (clubs, rows, played) = league_rows(mem)?;
+    Ok((rows.iter().map(|r| clubs[r.club]).collect(), played))
+}
+
+/// The league phase's clubs (by first appearance in the diary), their table and the games played.
+fn league_rows(mem: &mut guest::mem::Memory) -> Result<(Vec<u32>, Vec<lma_data::league::Row>, usize), String> {
+    let (at, size) = (mem.read32(DIARY), mem.read32(DIARY + 4) as usize);
+    if at == 0 || size == 0 {
+        return Err("no diary".into());
+    }
+    let mut diary = vec![0u8; size];
+    mem.read(at, &mut diary);
+    let games = lma_data::diary::league_phase_results(&diary, guest::rec::base_year() as i32).map_err(|e| e.to_string())?;
+    let mut clubs: Vec<u32> = Vec::with_capacity(36);
+    for &(h, a, _) in &games {
+        for u in [h as u32, a as u32] {
+            if !clubs.contains(&u) {
+                clubs.push(u);
+            }
+        }
+    }
+    if clubs.len() != lma_data::league::CLUBS {
+        return Err(format!("{} clubs in the league phase", clubs.len()));
+    }
+    let index = |u: u16| clubs.iter().position(|&c| c == u as u32).unwrap();
+    let scores: Vec<lma_data::league::Score> = games.iter().filter_map(|&(h, a, s)| s.map(|(hg, ag)| (index(h), index(a), hg, ag))).collect();
+    let rows = lma_data::league::table(&scores);
+    Ok((clubs, rows, scores.len()))
+}
+
+/// The cup screens' standings store (0x820df550's, at [0x8273d6ac]): 6 matchdays x 8 groups x 4
+/// places of 8 bytes for the European Cup's round 42, UEFA's groups right behind it.
+const STANDINGS: u32 = 0x8273_D6AC;
+const STANDINGS_FIRST: u32 = 0x7243;
+const STANDINGS_MATCHDAYS: usize = 6;
+
+/// One standings entry as 0x82135930 packs it: uid, won, drawn, lost, scored, conceded, points.
+fn standings_entry(uid: u32, r: &lma_data::league::Row) -> u64 {
+    let b = |v: u16| v.min(255) as u64;
+    (uid as u64 & 0xffff) << 48 | b(r.won as u16) << 40 | b(r.drawn as u16) << 32 | b(r.lost as u16) << 24 | b(r.scored) << 16 | b(r.conceded) << 8 | b(r.points())
+}
+
+/// The table into the screens' store: places 1-32 as the 8 groups of 4 the screens show (A = 1st-4th,
+/// ..., H = 29th-32nd), on the matchday just played and every one after it, as the game does. The
+/// store has 6 matchdays: days 7 and 8 go into the 6th.
+fn league_standings(mem: &mut guest::mem::Memory, clubs: &[u32], rows: &[lma_data::league::Row], played: usize) {
+    let base = mem.read32(STANDINGS);
+    if base == 0 || played == 0 {
+        return;
+    }
+    let day = (played.div_ceil(lma_data::league::CLUBS / 2) - 1).min(STANDINGS_MATCHDAYS - 1);
+    for md in day..STANDINGS_MATCHDAYS {
+        for (place, r) in rows.iter().take(32).enumerate() {
+            let at = (md as u32 * 8 + place as u32 / 4) * 4 + place as u32 % 4 + STANDINGS_FIRST;
+            mem.write64(base + 8 * at, standings_entry(clubs[r.club], r));
+        }
+    }
+}
+
+/// The final table's order, once all 144 games are played.
+fn final_order(mem: &mut guest::mem::Memory) -> Result<Vec<u32>, String> {
+    let (order, played) = league_order(mem)?;
+    if played != lma_data::league::CLUBS * lma_data::league::DAYS / 2 {
+        return Err(format!("{played} of 144 league games played"));
+    }
+    Ok(order)
+}
+
+/// The play-off: 9th-16th against 17th-24th (`lma_data::league::playoff`), as (first-leg home, away).
+fn playoff_ties(mem: &mut guest::mem::Memory, seed: u64) -> Result<Vec<(u32, u32)>, String> {
+    let order = final_order(mem)?;
+    let idx: Vec<usize> = (0..order.len()).collect();
+    Ok(lma_data::league::playoff(&idx, seed).iter().map(|t| (order[t.first], order[t.second])).collect())
+}
+
+/// The last 16: the top 8 against the play-off's winners (in 0x827414e0, collected by the game's
+/// round-done code), by bracket (`lma_data::league::last_16`).
+fn last_16_ties(mem: &mut guest::mem::Memory, seed: u64) -> Result<Vec<(u32, u32)>, String> {
+    let order = final_order(mem)?;
+    let idx: Vec<usize> = (0..order.len()).collect();
+    // the brackets come from the places alone, whatever the play-off's draw within them was
+    let ties = lma_data::league::playoff(&idx, 0);
+    let won: Vec<u32> = (0..16).map(|k| mem.read32(QUALIFIERS + 4 * k)).filter(|&u| u != 0).collect();
+    let mut winners = Vec::with_capacity(8);
+    for t in &ties {
+        let (a, b) = (order[t.first], order[t.second]);
+        match (won.contains(&a), won.contains(&b)) {
+            (true, false) => winners.push(t.first),
+            (false, true) => winners.push(t.second),
+            _ => return Err(format!("the play-off tie {a:#x} v {b:#x} has no single winner in 0x827414e0")),
+        }
+    }
+    Ok(lma_data::league::last_16(&idx, &ties, &winners, seed).iter().map(|t| (order[t.first], order[t.second])).collect())
+}
+
+/// The ties as the knockout writer's list: mode 1, the clubs in pairs, the count.
+fn write_tie_list(mem: &mut guest::mem::Memory, list: u32, ties: &[(u32, u32)]) {
+    mem.write32(list, 1);
+    for (k, &(h, a)) in ties.iter().enumerate() {
+        mem.write32(list + 4 + 8 * k as u32, h);
+        mem.write32(list + 8 + 8 * k as u32, a);
+    }
+    mem.write32(list + 0x404, 2 * ties.len() as u32);
+}
+
+/// The group stage's end (0x8213a2d0, after each round-42 matchday from 0x8213a718): the game builds
+/// 8 group tables. With the league phase there are no groups: after the last matchday the UEFA Cup
+/// gets the 25th-32nd (its last 32 still takes 8 from the European Cup), the winners' lists are
+/// cleared for the play-off's winners and the straight entrants' list as the game clears it.
+pub const GROUP_END: u32 = 0x8213_A2D0;
+
+pub fn league_phase_end(mem: &mut guest::mem::Memory) -> Result<bool, String> {
+    let (clubs, rows, played) = league_rows(mem)?;
+    league_standings(mem, &clubs, &rows, played);
+    let order: Vec<u32> = rows.iter().map(|r| clubs[r.club]).collect();
+    if played < lma_data::league::CLUBS * lma_data::league::DAYS / 2 {
+        return Ok(false);
+    }
+    for k in 0..8 {
+        mem.write32(UEFA_THIRDS + 4 * k, order[24 + k as usize]);
+    }
+    for k in 0..16 {
+        mem.write32(QUALIFIERS + 4 * k, 0); // with RUNNERS_UP, the 16 words the play-off's winners fill
+        mem.write32(DIRECT_ENTRANTS + 4 * k, 0);
+    }
+    debug_assert_eq!(RUNNERS_UP, QUALIFIERS + 0x20);
+    Ok(true)
+}
+
+/// The standings store's reader, 0x820df370(matchday, group, place, comp, round).
+pub const STANDINGS_READ: u32 = 0x820D_F370;
+
+static STANDINGS_READ_GAME: std::sync::OnceLock<guest::rec::FuncFn> = std::sync::OnceLock::new();
+
+/// The store's reader with the league phase's matchdays 7 and 8 read from the 6th, where
+/// `league_standings` keeps them (the game's reader answers an empty entry past the 6th).
+pub fn standings_read_block_for(game: guest::rec::FuncFn) -> guest::rec::FuncFn {
+    let _ = STANDINGS_READ_GAME.set(game);
+    standings_read_block
+}
+
+fn standings_read_block(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, pc: u32, b: &mut i64) -> Result<u32, guest::cpu::Stop> {
+    if c.gpr[6] as u32 == 0x37 && c.gpr[7] as u32 == LEAGUE_ROUND && (c.gpr[3] as u32 as usize) >= STANDINGS_MATCHDAYS {
+        c.gpr[3] = STANDINGS_MATCHDAYS as u64 - 1;
+    }
+    let Some(game) = STANDINGS_READ_GAME.get() else { unreachable!("standings_read_block is only installed through standings_read_block_for") };
+    game(c, m, pc, b)
+}
+
+static GROUP_END_GAME: std::sync::OnceLock<guest::rec::FuncFn> = std::sync::OnceLock::new();
+
+/// The group stage's end with the league phase's own, the game's behind it when the diary has no
+/// league phase.
+pub fn group_end_block_for(game: guest::rec::FuncFn) -> guest::rec::FuncFn {
+    let _ = GROUP_END_GAME.set(game);
+    group_end_block
+}
+
+fn group_end_block(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, pc: u32, b: &mut i64) -> Result<u32, guest::cpu::Stop> {
+    if LEAGUE_PHASE.load(std::sync::atomic::Ordering::Relaxed) {
+        match league_phase_end(m) {
+            Ok(_) => {
+                *b -= 5_000;
+                return Ok(c.lr as u32 & !3);
+            }
+            Err(e) => eprintln!("league phase end: {e}; the game's group tables instead"),
+        }
+    }
+    let Some(game) = GROUP_END_GAME.get() else { unreachable!("group_end_block is only installed through group_end_block_for") };
+    game(c, m, pc, b)
+}
+
+static EUROPEAN_CUP_DRAW_GAME: std::sync::OnceLock<guest::rec::FuncFn> = std::sync::OnceLock::new();
+
+/// The European Cup's draws with the league phase's round 42 native, the game's draws behind it.
+pub fn european_cup_draw_block_for(game: guest::rec::FuncFn) -> guest::rec::FuncFn {
+    let _ = EUROPEAN_CUP_DRAW_GAME.set(game);
+    european_cup_draw_block
+}
+
+fn european_cup_draw_block(c: &mut guest::cpu::Cpu, m: &mut guest::mem::Memory, pc: u32, b: &mut i64) -> Result<u32, guest::cpu::Stop> {
+    let round = c.gpr[3] as u32;
+    if LEAGUE_PHASE.load(std::sync::atomic::Ordering::Relaxed) {
+        // seeded from the guest clock: the same in a deterministic run, another league each career
+        let seed = c.timebase ^ 0x37;
+        if round == LEAGUE_ROUND {
+            let list = LEAGUE_LIST.load(std::sync::atomic::Ordering::Relaxed);
+            if list != 0 {
+                read_league_tables(c, m, b, list)?;
+            }
+            match league_phase_draw(m, seed) {
+                Ok(()) => {
+                    *b -= 20_000;
+                    return Ok(c.lr as u32 & !3);
+                }
+                Err(e) => eprintln!("league phase: {e}; the game's group draw instead"),
+            }
+        }
+        if round == PLAYOFF_ROUND || round == LAST_16_ROUND {
+            let list = LEAGUE_LIST.load(std::sync::atomic::Ordering::Relaxed);
+            let ties = if round == PLAYOFF_ROUND { playoff_ties(m, seed) } else { last_16_ties(m, seed) };
+            match ties {
+                Ok(ties) if list != 0 => {
+                    // the game's knockout writer, as the draw's own tail: the pairs as given (mode 1,
+                    // no shuffle), both legs
+                    write_tie_list(m, list, &ties);
+                    c.gpr[3] = 0x37;
+                    c.gpr[4] = round as u64;
+                    c.gpr[5] = list as u64;
+                    c.gpr[6] = 0;
+                    *b -= 2_000;
+                    return Ok(KNOCKOUT_WRITER);
+                }
+                Ok(_) => eprintln!("league phase: no list memory for round {round}"),
+                Err(e) => eprintln!("league phase: round {round}: {e}"),
+            }
+        }
+    }
+    let Some(game) = EUROPEAN_CUP_DRAW_GAME.get() else { unreachable!("european_cup_draw_block is only installed through european_cup_draw_block_for") };
     game(c, m, pc, b)
 }
 
@@ -1737,7 +2321,7 @@ mod mod_hook_tests {
     const TABLE: u32 = 0x4000_0000;
 
     fn machine() -> Machine {
-        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false };
+        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false, resources: vec![] };
         let dir = std::env::temp_dir();
         let mut m = Machine::new(&x, &dir, &dir);
         m.mem.write32(PLAYER_TABLE, TABLE);
@@ -1746,6 +2330,177 @@ mod mod_hook_tests {
 
     fn rec(idx: u32) -> u32 {
         TABLE + idx * 0x12c
+    }
+
+    #[test]
+    fn the_league_phase_blocks_are_never_called_directly() {
+        // a same-part direct call skips the block table, so a block swap there would never run
+        for a in [EUROPEAN_CUP_DRAW, GROUP_END, STANDINGS_READ] {
+            assert!(ADDRESSES.contains(&a), "{a:#x} is not in guest::hooks::ADDRESSES");
+        }
+    }
+
+    /// The league phase's round-42 draw on a machine: 16 straight entrants, 16 qualifiers and 4
+    /// extras of 9 countries, a diary of 8 league days of 18 blanks; every day gets 18 games of the
+    /// 36, each club once, never two of a country. Played out: the end gives the UEFA Cup the
+    /// 25th-32nd, the play-off is 17th-24th v 9th-16th, the last 16 the top 8 v its winners. A diary
+    /// without the shape is refused untouched.
+    #[test]
+    fn the_league_phase_runs_from_the_draw_to_the_last_16() {
+        let mut m = machine();
+        const MAP: u32 = 0x4100_0000;
+        const RECS: u32 = 0x4110_0000;
+        const STADIUMS: u32 = 0x4120_0000;
+        const DIARY_AT: u32 = 0x4130_0000;
+        m.mem.write32(CLUB_UID_MAP, MAP);
+        m.mem.write32(CLUB_RECORDS, RECS);
+        m.mem.write32(STADIUM_RECORDS, STADIUMS);
+        // club uid 101 + k: record k, stadium k, country k % 9
+        let uids: Vec<u32> = (0..36).map(|k| 101 + k).collect();
+        for (k, &u) in uids.iter().enumerate() {
+            m.mem.write16(MAP + u * 2, k as u16);
+            m.mem.write32(RECS + k as u32 * 0x3d8 + 4, (k as u32) << 21);
+            m.mem.write32(STADIUMS + k as u32 * 0x20 + 0xc, ((k as u32 % 9) + 1) << 15);
+        }
+        for k in 0..16 {
+            m.mem.write32(DIRECT_ENTRANTS + 4 * k, uids[k as usize]);
+            m.mem.write32(QUALIFIERS + 4 * k, uids[20 + k as usize]);
+        }
+        // the 4 extras come from the UEFA Cup's first round: its set in country order with each
+        // country's clubs by place, so the first of each of its first 4 countries (clubs 16-19);
+        // 137 and 138 are second clubs of clubs 16's and 17's countries and stay
+        LEAGUE_EXTRAS.write().unwrap().clear();
+        for (k, like) in [(36u32, 16u32), (37, 17)] {
+            m.mem.write16(MAP + (101 + k) * 2, k as u16);
+            m.mem.write32(RECS + k * 0x3d8 + 4, like << 21);
+        }
+        let uefa_set = [uids[16], 137, uids[17], uids[18], 138, uids[19]];
+        for (k, &u) in uefa_set.iter().enumerate() {
+            m.mem.write32(UEFA_FIRST_ROUND + 4 * k as u32, u);
+        }
+        // club 16's league: 5 places, club 16 5th, 137 (in the UEFA Cup) 6th, 140 7th: 140 takes
+        // club 16's slot; club 17's league has no club below it, so its slot stays empty
+        *LEAGUE_TABLES.write().unwrap() = [(0, [0; 10]); 8];
+        LEAGUE_TABLES.write().unwrap()[0] = (5, [1, 2, 3, 4, uids[16], 137, 140, 0, 0, 0]);
+        LEAGUE_TABLES.write().unwrap()[1] = (5, [5, 6, 7, 8, uids[17], 0, 0, 0, 0, 0]);
+        assert_eq!(club_country(&mut m.mem, 105), 5);
+        assert_eq!(club_country(&mut m.mem, 9000), 0x33, "unmapped");
+        // the diary: the start, 8 Wednesdays of round 42 (18 blanks each), the end
+        let year = guest::rec::base_year() as i32;
+        let pack = |(y, mo, d): (i32, u32, u32)| -> [u8; 2] { ((d as u16) << 11 | ((mo - 1) as u16) << 7 | ((y - year) as u16) << 2).to_be_bytes() };
+        let rec = |date, kind: u8, n: u8, body: &[u8]| -> Vec<u8> {
+            let mut r = pack(date).to_vec();
+            r.extend_from_slice(&[n, kind]);
+            r.extend_from_slice(&((6 + body.len()) as u16).to_be_bytes());
+            r.extend_from_slice(body);
+            r
+        };
+        let mut diary = rec((year, 7, 1), 2, 1, &[0xff, 0xff]);
+        let days = [(year, 9, 13), (year, 9, 27), (year, 10, 18), (year, 11, 1), (year, 11, 22), (year, 12, 6), (year + 1, 1, 17), (year + 1, 1, 24)];
+        for d in days {
+            let mut body = vec![55, 42, 18, 0];
+            for _ in 0..18 {
+                body.extend_from_slice(&[0, 0, 0, 0, 0xff, 0]);
+            }
+            diary.extend(rec(d, 0, 1, &body));
+        }
+        diary.extend(rec((year + 1, 6, 30), 3, 1, &[0, 0, 0xff, 0xff]));
+        m.mem.write32(DIARY, DIARY_AT);
+        m.mem.write32(DIARY + 4, diary.len() as u32);
+        m.mem.write(DIARY_AT, &diary);
+        league_phase_draw(&mut m.mem, 5).unwrap();
+        assert_eq!((0..6).map(|k| m.mem.read32(UEFA_FIRST_ROUND + 4 * k)).collect::<Vec<_>>(), [140, uefa_set[1], 0, 0, uefa_set[4], 0], "the extras left the UEFA Cup, their leagues' next clubs in");
+        let mut out = vec![0u8; diary.len()];
+        m.mem.read(DIARY_AT, &mut out);
+        let recs = lma_data::diary::day_records(&out, year).unwrap();
+        let mut days_seen = 0;
+        for r in recs.iter().filter(|r| r.kind == 0) {
+            let mut once = std::collections::HashSet::new();
+            for g in 0..18 {
+                let f = &r.bytes[10 + 6 * g..16 + 6 * g];
+                let (h, a) = (u16::from_be_bytes([f[0], f[1]]) as u32, u16::from_be_bytes([f[2], f[3]]) as u32);
+                assert!(uids.contains(&h) && uids.contains(&a) && f[4] == 0xff, "{:?} game {g}", r.date);
+                assert_ne!(club_country(&mut m.mem, h), club_country(&mut m.mem, a));
+                assert!(once.insert(h) && once.insert(a), "{:?}: every club once", r.date);
+            }
+            days_seen += 1;
+        }
+        assert_eq!(days_seen, 8);
+        // the league is played: the home side wins by its club's seeding (a lower uid wins), 2-0
+        let (order, played) = league_order(&mut m.mem).unwrap();
+        assert_eq!((order.len(), played), (36, 0));
+        assert!(league_phase_end(&mut m.mem).is_ok_and(|done| !done), "nothing to do before the last game");
+        let mut played_diary = out.clone();
+        let mut p = 0;
+        for rec in lma_data::diary::day_records(&out, year).unwrap() {
+            if rec.kind == 0 {
+                for g in 0..18 {
+                    let f = p + 10 + 6 * g;
+                    let (h, a) = (u16::from_be_bytes([out[f], out[f + 1]]), u16::from_be_bytes([out[f + 2], out[f + 3]]));
+                    played_diary[f + 4] = if h < a { 0x20 } else { 0x02 };
+                }
+            }
+            p += rec.bytes.len();
+        }
+        m.mem.write(DIARY_AT, &played_diary);
+        let (order, played) = league_order(&mut m.mem).unwrap();
+        assert_eq!(played, 144);
+        const STORE: u32 = 0x4200_0000;
+        m.mem.write32(STANDINGS, STORE);
+        assert!(league_phase_end(&mut m.mem).unwrap());
+        assert_eq!((0..8).map(|k| m.mem.read32(UEFA_THIRDS + 4 * k)).collect::<Vec<_>>(), order[24..32], "25th-32nd to the UEFA Cup");
+        // the screens' store: places 1-32 as groups A-H on the last matchday it keeps
+        let entry = |m: &mut Machine, md: u32, group: u32, pos: u32| m.mem.read64(STORE + 8 * ((md * 8 + group) * 4 + pos + STANDINGS_FIRST));
+        for place in 0..32 {
+            assert_eq!((entry(&mut m, 5, place / 4, place % 4) >> 48) as u32, order[place as usize], "place {place}");
+        }
+        assert_eq!(entry(&mut m, 5, 0, 0) & 0xffff_ffff_ffff, 0x08_00_00_10_00_18, "the top club: won 8, 16-0, 24 points");
+        assert_eq!(entry(&mut m, 4, 0, 0), 0, "earlier matchdays are left as they were");
+        assert!((0..16).all(|k| m.mem.read32(QUALIFIERS + 4 * k) == 0 && m.mem.read32(DIRECT_ENTRANTS + 4 * k) == 0));
+        // the play-off: 17th-24th at home first against 9th-16th
+        let po = playoff_ties(&mut m.mem, 9).unwrap();
+        assert_eq!(po.len(), 8);
+        for &(first, second) in &po {
+            let (f, s) = (order.iter().position(|&u| u == first).unwrap(), order.iter().position(|&u| u == second).unwrap());
+            assert!((16..24).contains(&f) && (8..16).contains(&s));
+        }
+        // the list the knockout writer takes
+        const LIST: u32 = 0x4140_0000;
+        write_tie_list(&mut m.mem, LIST, &po);
+        assert_eq!((m.mem.read32(LIST), m.mem.read32(LIST + 0x404)), (1, 16));
+        assert_eq!((m.mem.read32(LIST + 4), m.mem.read32(LIST + 8)), po[0]);
+        // the seeded clubs win; the game collects them into 0x827414e0
+        assert!(last_16_ties(&mut m.mem, 9).is_err(), "no winners yet");
+        for (k, &(_, s)) in po.iter().enumerate() {
+            m.mem.write32(QUALIFIERS + 4 * k as u32, s);
+        }
+        let l16 = last_16_ties(&mut m.mem, 9).unwrap();
+        assert_eq!(l16.len(), 8);
+        for &(first, second) in &l16 {
+            assert!(order[..8].contains(&second), "a top-8 club at home second");
+            assert!(po.iter().any(|t| t.1 == first), "against a play-off winner");
+        }
+        // a diary of the old shape (here: already full) is refused and left as it is
+        assert!(league_phase_draw(&mut m.mem, 6).is_err());
+        let mut again = vec![0u8; diary.len()];
+        m.mem.read(DIARY_AT, &mut again);
+        assert_eq!(again, played_diary);
+        // and so are 35 entrants; with the extras from the UEFA Cup, an empty straight place
+        // (no holder) takes a 5th
+        m.mem.write32(QUALIFIERS + 60, 0);
+        assert!(league_entrants(&mut m.mem, &uids[16..20]).is_none());
+        // (the group end wrote the winners and runners-up over the sets' words)
+        for k in 0..16 {
+            m.mem.write32(QUALIFIERS + 4 * k, uids[20 + k as usize]);
+            m.mem.write32(DIRECT_ENTRANTS + 4 * k, uids[k as usize]);
+        }
+        m.mem.write32(DIRECT_ENTRANTS + 8, 0);
+        for (k, u) in [uids[16], uids[17], uids[18], uids[19], uids[2]].into_iter().enumerate() {
+            m.mem.write32(UEFA_FIRST_ROUND + 4 * k as u32, u);
+        }
+        assert_eq!(uefa_extras(&mut m.mem, 5).len(), 5, "5 countries");
+        assert!(league_entrants(&mut m.mem, &[uids[16], uids[17], uids[18], uids[19], uids[2]]).is_some());
+        LEAGUE_EXTRAS.write().unwrap().clear();
     }
 
     /// The mod's places replace the nation's hard-coded counts and the game's function runs on;
@@ -1903,7 +2658,7 @@ mod mod_hook_tests {
         let v = slot_get(&mut m.mem, obj, 0, 19, 4, virt);
         assert_eq!(m.mem.read32(v), 120, "row 19: the entry after the gap");
         let v = slot_get(&mut m.mem, obj, 1, 17, 4, virt);
-        assert_eq!(v, virt + (4 + 1) * SLOT_SIZE as u32, "team B's second reserve");
+        assert!((virt + 4 * SLOT_SIZE as u32..virt + 8 * SLOT_SIZE as u32).contains(&v), "team B's second reserve, in a team B slot");
         let mut img = [0u8; SLOT_SIZE];
         m.mem.read(v, &mut img);
         assert_eq!((word(&img, 0), word(&img, 4)), (217, 17), "the entry's id, the row's index");
@@ -2022,6 +2777,187 @@ mod mod_hook_tests {
         }
         assert_eq!(slot_lookup(&mut m.mem, obj, 117, true, 4), s15);
         assert_eq!(m.mem.read32(s15 + SLOT_STATE as u32), STATE_BENCH, "the slot's own state until the swap");
+        *RESERVES.lock().unwrap() = None;
+    }
+
+    /// #530 undo: a reserve queued by the subs menu (his virtual slot's state 6) keeps that slot as
+    /// the menu left it, and the undo's lookups find him there instead of swapping him in.
+    #[test]
+    fn a_queued_reserve_can_be_undone() {
+        let _serial = RESERVES_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = machine();
+        let obj = 0x4500_0000u32;
+        let virt = 0x4600_0000u32;
+        let entries = obj - ENTRIES_FROM_OBJ;
+        for team in 0..2u32 {
+            for i in 0..16u32 {
+                let s = slot_at(obj, team, i);
+                m.mem.write32(s, 100 * (team + 1) + i);
+                m.mem.write32(s + SLOT_STATE as u32, if i < 11 { 1 } else { STATE_BENCH });
+            }
+            for k in 16..32u32 {
+                let e = entries + team * ENTRY_TEAM_STRIDE + k * ENTRY_STRIDE;
+                m.mem.write32(e, if k < 20 { 100 * (team + 1) + k } else { u32::MAX });
+            }
+        }
+        *RESERVES.lock().unwrap() = None;
+        // the menu shows reserve 117 on row 17 and queues him (state 6, a flag at +0x228)
+        let v = slot_get(&mut m.mem, obj, 0, 17, 4, virt);
+        assert_eq!((m.mem.read32(v), m.mem.read32(v + SLOT_STATE as u32)), (117, STATE_BENCH));
+        m.mem.write32(v + SLOT_STATE as u32, STATE_QUEUED);
+        m.mem.write32(v + 0x228, 1);
+        // the screen asks again: the slot stays as queued
+        assert_eq!(slot_get(&mut m.mem, obj, 0, 17, 4, virt), v);
+        assert_eq!((m.mem.read32(v + SLOT_STATE as u32), m.mem.read32(v + 0x228)), (STATE_QUEUED, 1));
+        // the undo's lookup: his virtual slot, nobody swapped into the bench
+        assert_eq!(slot_lookup(&mut m.mem, obj, 117, false, 4), 0);
+        assert_eq!(reserve_slot(&mut m.mem, obj, 117, 4, virt), v);
+        assert!((11..16).all(|i| m.mem.read32(slot_at(obj, 0, i)) == 100 + i), "the bench is untouched");
+        // once undone (state 2 again) the row is rebuilt as before
+        m.mem.write32(v + SLOT_STATE as u32, STATE_BENCH);
+        assert_eq!(slot_get(&mut m.mem, obj, 0, 17, 4, virt), v);
+        assert_eq!(m.mem.read32(v), 117);
+        assert_eq!(reserve_slot(&mut m.mem, obj, 999, 4, virt), 0, "not a reserve");
+        *RESERVES.lock().unwrap() = None;
+    }
+
+    /// The lookup block itself: only the undo's call sites fall back to a reserve's virtual slot;
+    /// a substitute on the real bench is found where he is, and any other caller still gets 0 for
+    /// a reserve (the game's own answer).
+    #[test]
+    fn only_the_undo_lookups_find_a_reserve() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _serial = RESERVES_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = machine();
+        let obj = 0x4500_0000u32;
+        let virt = 0x4600_0000u32;
+        let entries = obj - ENTRIES_FROM_OBJ;
+        for i in 0..16u32 {
+            let s = slot_at(obj, 0, i);
+            m.mem.write32(s, 100 + i);
+            m.mem.write32(s + SLOT_STATE as u32, if i < 11 { 1 } else { STATE_BENCH });
+        }
+        for k in 16..32u32 {
+            m.mem.write32(entries + k * ENTRY_STRIDE, if k < 20 { 100 + k } else { u32::MAX });
+        }
+        *RESERVES.lock().unwrap() = None;
+        let (old_extra, old_virt) = (BENCH_EXTRA.swap(4, Relaxed), VIRTUAL_SLOTS.swap(virt, Relaxed));
+        let v = slot_get(&mut m.mem, obj, 0, 17, 4, virt);
+        let mut ask = |m: &mut Machine, lr: u32, id: u32| {
+            m.cpu.lr = lr as u64;
+            m.cpu.gpr[3] = obj as u64;
+            m.cpu.gpr[4] = id as u64;
+            let mut b = 0i64;
+            assert_eq!(slot_lookup_block(&mut m.cpu, &mut m.mem, 0, &mut b).unwrap(), lr);
+            m.cpu.gpr[3] as u32
+        };
+        for &lr in &UNDO_LOOKUP_RETS {
+            assert_eq!(ask(&mut m, lr, 112), slot_at(obj, 0, 12), "a real substitute, from {lr:#x}");
+            assert_eq!(ask(&mut m, lr, 117), v, "a reserve's virtual slot, from {lr:#x}");
+            assert_eq!(ask(&mut m, lr, 999), 0, "nobody, from {lr:#x}");
+        }
+        assert_eq!(ask(&mut m, 0x8200_0000, 117), 0, "another caller: no reserve");
+        assert_eq!(ask(&mut m, 0x8200_0000, 112), slot_at(obj, 0, 12));
+        assert!((11..16).all(|i| m.mem.read32(slot_at(obj, 0, i)) == 100 + i), "the bench is untouched");
+        BENCH_EXTRA.store(old_extra, Relaxed);
+        VIRTUAL_SLOTS.store(old_virt, Relaxed);
+        *RESERVES.lock().unwrap() = None;
+    }
+
+    /// #530: a reserve swapped into an empty bench slot (id -1, zeros) gets a player's slot image (his
+    /// team at +0x230, which the substitution counts substitutions through), the slot's own index,
+    /// the bench state, and nobody is kept for the empty slot.
+    #[test]
+    fn a_reserve_in_an_empty_slot_gets_a_players_slot_image() {
+        let _serial = RESERVES_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = machine();
+        let obj = 0x4500_0000u32;
+        let entries = obj - ENTRIES_FROM_OBJ;
+        for i in 0..16u32 {
+            let s = slot_at(obj, 0, i);
+            let empty = i == 13 || i == 15;
+            m.mem.write32(s, if empty { u32::MAX } else { 100 + i });
+            m.mem.write32(s + 4, if empty { 0 } else { i });
+            m.mem.write32(s + 0x230, if empty { 0 } else { obj + 0x30 });
+            m.mem.write32(s + SLOT_STATE as u32, if empty { 0 } else if i < 11 { 1 } else { STATE_BENCH });
+        }
+        m.mem.write32(entries + 16 * ENTRY_STRIDE, 116);
+        for k in 17..32u32 {
+            m.mem.write32(entries + k * ENTRY_STRIDE, u32::MAX);
+        }
+        *RESERVES.lock().unwrap() = None;
+        let s = slot_lookup(&mut m.mem, obj, 116, true, 4);
+        assert_eq!(s, slot_at(obj, 0, 15), "the last unused bench slot");
+        assert_eq!((m.mem.read32(s), m.mem.read32(s + 4)), (116, 15), "his id, the slot's index");
+        assert_eq!(m.mem.read32(s + 0x230), obj + 0x30, "his team, from slot 14");
+        assert_eq!(m.mem.read32(s + SLOT_STATE as u32), STATE_BENCH);
+        assert!(RESERVES.lock().unwrap().as_ref().is_none_or(|r| r.is_empty()), "no one kept for the empty slot");
+        *RESERVES.lock().unwrap() = None;
+    }
+
+    /// #530 (the maintainer, 28 Oct: "the 5th sub glitched"): the subs menu keeps its own id per row and queues
+    /// the cursor row's slot, so a virtual row holds the reserve with the menu's id for it (a gap or a
+    /// player who can't come on is a blank row); the other team, with no menu over it, keeps the
+    /// reserve list's order, and the undo finds a reserve on the row the menu has him.
+    #[test]
+    fn virtual_rows_follow_the_menus_row_ids() {
+        let _serial = RESERVES_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = machine();
+        let obj = 0x4500_0000u32;
+        let virt = 0x4600_0000u32;
+        let ids = 0x4700_0000u32;
+        let entries = obj - ENTRIES_FROM_OBJ;
+        for team in 0..2u32 {
+            for i in 0..16u32 {
+                m.mem.write32(slot_at(obj, team, i), 100 * (team + 1) + i);
+            }
+            for k in 16..32u32 {
+                let e = entries + team * ENTRY_TEAM_STRIDE + k * ENTRY_STRIDE;
+                m.mem.write32(e, if k < 20 { 100 * (team + 1) + k } else { u32::MAX });
+            }
+        }
+        *RESERVES.lock().unwrap() = None;
+        m.mem.write32(TEAM_SCREEN_TEAM, 0);
+        m.mem.write32(MENU_ROW_IDS, ids);
+        for (i, id) in [(16u32, 119i16), (17, -1), (18, 116), (19, 150)] {
+            m.mem.write16(ids + 2 * i, id as u16);
+        }
+        let row = |m: &mut Machine, team, i| {
+            let v = slot_get(&mut m.mem, obj, team, i, 4, virt);
+            if v == 0 { 0 } else { m.mem.read32(v) }
+        };
+        assert_eq!((16..20).map(|i| row(&mut m, 0, i)).collect::<Vec<_>>(), [119, 0, 116, 0], "the menu's ids; a gap and a non-reserve blank");
+        assert_eq!((16..20).map(|i| row(&mut m, 1, i)).collect::<Vec<_>>(), [216, 217, 218, 219], "the other team: the reserve list");
+        assert_eq!(reserve_slot(&mut m.mem, obj, 116, 4, virt), slot_get(&mut m.mem, obj, 0, 18, 4, virt), "the undo finds 116 on row 18");
+        assert_eq!(reserve_slot(&mut m.mem, obj, 117, 4, virt), 0, "117 is on none of the menu's rows");
+        // queued (state 6): the menu swaps the two ids in its table while the substitution waits; the
+        // row keeps the reserve, and once he has come on (in a real slot) it follows the table again
+        let v = slot_get(&mut m.mem, obj, 0, 18, 4, virt);
+        m.mem.write32(v + SLOT_STATE as u32, STATE_QUEUED);
+        m.mem.write16(ids + 2 * 18, 105);
+        assert_eq!(slot_get(&mut m.mem, obj, 0, 18, 4, virt), v);
+        assert_eq!((m.mem.read32(v), m.mem.read32(v + SLOT_STATE as u32)), (116, STATE_QUEUED), "still the queued reserve");
+        assert_eq!(reserve_slot(&mut m.mem, obj, 116, 4, virt), v, "the undo finds him queued, off the reserve rows");
+        VIRTUAL_SLOTS.store(virt, std::sync::atomic::Ordering::Relaxed);
+        m.mem.write16(ids + 2 * 19, -1i16 as u16);
+        assert_eq!(reserve_rows(&mut m.mem, obj, 0, 4), 3, "his row (18) still counts, past the table's last reserve (16)");
+        VIRTUAL_SLOTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        m.mem.write16(ids + 2 * 19, 150);
+        let r16 = slot_get(&mut m.mem, obj, 0, 16, 4, virt);
+        assert_eq!(m.mem.read32(r16), 119, "the other rows keep their own slots");
+        assert_ne!(slot_get(&mut m.mem, obj, 0, 16, 4, virt), v);
+        m.mem.write32(slot_at(obj, 0, 15), 116);
+        assert_eq!(slot_get(&mut m.mem, obj, 0, 18, 4, virt), 0, "on now: the row is the table's again (105, not a reserve)");
+        m.mem.write32(slot_at(obj, 0, 15), 115);
+        m.mem.write32(v + SLOT_STATE as u32, 0);
+        // the menu's table also lists injured players (no reserves): a reserve past row 19 gets a row
+        m.mem.write16(ids + 2 * 18, 116);
+        m.mem.write16(ids + 2 * 21, 117);
+        assert_eq!(reserve_rows(&mut m.mem, obj, 0, 4), 6, "rows 16..21");
+        assert_eq!(row(&mut m, 0, 21), 117);
+        assert_eq!(reserve_rows(&mut m.mem, obj, 1, 4), 4, "the other team: one per reserve");
+        m.mem.write32(MENU_ROW_IDS, 0);
+        assert_eq!((16..20).map(|i| row(&mut m, 0, i)).collect::<Vec<_>>(), [116, 117, 118, 119], "no menu: the reserve list");
         *RESERVES.lock().unwrap() = None;
     }
 
@@ -2259,6 +3195,20 @@ mod mod_hook_tests {
         assert_eq!(round_wage(&mut m.mem, 20, 250_000), 150, "at least 150");
     }
 
+    /// `rating_wage_scale`: the game's wage x the scale, rounded as the game rounds, capped.
+    #[test]
+    fn rating_wage_scales_and_rounds() {
+        let mut m = machine();
+        for (k, (step, below)) in [(10, 2000), (50, 5000), (100, 20_000), (500, 50_000), (1000, 100_000), (10_000, 250_000)].into_iter().enumerate() {
+            m.mem.write32(0x8200_560C + 8 * k as u32, step);
+            m.mem.write32(0x8200_5610 + 8 * k as u32, below);
+        }
+        assert_eq!(scale_rating_wage(&mut m.mem, 80_000, 5000, WAGE_MAX), 400_000, "a capped top-flight regen x 5");
+        assert_eq!(scale_rating_wage(&mut m.mem, 80_000, 5000, 250_000), 250_000, "the game's cap without ai_wage_offers");
+        assert_eq!(scale_rating_wage(&mut m.mem, 1_234, 1000, WAGE_MAX), round_wage(&mut m.mem, 1_234, WAGE_MAX), "x 1 is the game's rounding");
+        assert!(guest::hooks::ADDRESSES.contains(&RATING_WAGE), "recompiled callers must reach the block");
+    }
+
     /// The native block answers as the hook does, and leaves the rest to the game's getter.
     #[test]
     fn wage_block_matches_the_hook() {
@@ -2404,15 +3354,6 @@ mod mod_hook_tests {
 
 #[cfg(test)]
 mod fence_tests {
-    #[test]
-    fn the_nap_is_the_default_and_0_spins() {
-        assert_eq!(super::fence_nap_mode_of(None), 1, "unset: nap (#861)");
-        assert_eq!(super::fence_nap_mode_of(Some("1")), 1);
-        assert_eq!(super::fence_nap_mode_of(Some("0")), 0, "0: the spin as before");
-        assert_eq!(super::fence_nap_mode_of(Some("2")), 2, "2: hook installed, no nap");
-        assert_eq!(super::fence_nap_mode_of(Some("wait")), 1, "anything else naps");
-    }
-
     use super::*;
 
     #[test]
@@ -2435,6 +3376,18 @@ mod fence_tests {
         assert!(nap, "then it naps again");
         let (s, nap) = fence_nap(s, 104);
         assert!(!nap && s == (104, 0), "progress resets the count");
+    }
+
+    /// LMA_FENCE_NAP unset is the native wait in real time and no hook at all in a deterministic run
+    /// (fingerprints unchanged); `0` turns it off everywhere, and the explicit modes win over both.
+    #[test]
+    fn the_fence_wait_is_the_real_time_default() {
+        assert_eq!(super::fence_nap_mode(None, false), Some(3), "real time: the native wait");
+        assert_eq!(super::fence_nap_mode(None, true), None, "deterministic: no hook");
+        assert_eq!(super::fence_nap_mode(Some("0"), false), None, "off");
+        assert_eq!(super::fence_nap_mode(Some("1"), true), Some(1), "the timed nap, asked for");
+        assert_eq!(super::fence_nap_mode(Some("wait"), true), Some(3));
+        assert_eq!(super::fence_nap_mode(Some("2"), false), Some(2), "observe only");
     }
 
     /// A custom threshold (LMA_FENCE_NAP_AFTER) moves the first nap; every other unmoved poll after it
@@ -2461,7 +3414,7 @@ mod fence_tests {
     #[test]
     fn the_watchdog_hook_declines_and_naps_after_the_threshold() {
         std::env::set_var("LMA_FENCE_NAP", "1");
-        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false };
+        let x = xex::Xex { module_flags: 0, entry_point: 0x8200_0000, image_base: 0x8200_0000, image: vec![0; 0x1000], libraries: vec![], used_devkit_key: false, resources: vec![] };
         let dir = std::env::temp_dir();
         let mut m = Machine::new(&x, &dir, &dir);
         m.deterministic = true;

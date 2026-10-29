@@ -17,6 +17,10 @@
 //! `<game-blocks dir>/parts/` so the whole game compiles in parallel with modest memory.
 //! The generated code is derived from the user's own disc and must not be redistributed.
 
+mod emit;
+mod ir;
+mod live;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -149,7 +153,10 @@ fn switch_targets(text: &str) -> Vec<u32> {
     out
 }
 
-fn translate(pc: u32, w: u32) -> Option<String> {
+/// The mods' run-time values `translate` may emit (#145: the IR keeps such an op's text).
+const MOD_VALUES: [&str; 9] = ["base_year()", "subs_limit()", "value_cap()", "value_unit()", "wage_budget_cap()", "offer_cap()", "wage_offer_cap()", "formation_roles", "formation_names"];
+
+pub(crate) fn translate(pc: u32, w: u32) -> Option<String> {
     if let Some(s) = translate_vmx(w) {
         return Some(s);
     }
@@ -173,6 +180,19 @@ fn translate(pc: u32, w: u32) -> Option<String> {
         2026 => s.replace("2026", "(base_year()+20)"),
         _ => s,
     };
+    // a moddable number (#870): the immediate comes from guest::tune's table, set by mod.toml's [tune]
+    if let Some(i) = guest::tune::at(pc, w) {
+        let (crf, l) = (bits(w, 6, 8), bits(w, 10, 10) == 1);
+        return Some(match w >> 26 {
+            7 => format!("mulli(c,{d},{a},tune({i}));"),
+            8 => format!("subfic(c,{d},{a},tune({i}) as u64);"),
+            10 => format!("cmpli(c,{crf},{l},{a},tune({i}) as u64);"),
+            11 => format!("cmpi(c,{crf},{l},{a},tune({i}));"),
+            14 => format!("addi(c,{d},{a},tune({i}));"),
+            24 => format!("ori(c,{a},{d},tune({i}) as u64);"),
+            op => panic!("tunable {} at {pc:#x}: opcode {op} is not supported", guest::tune::TUNABLES[i].name),
+        });
+    }
     Some(match w >> 26 {
         // a competitive match's substitution limit (3 in vanilla), from mod.toml (#530)
         14 if pc == guest::rec::SUBS_SITE && a == 0 && simm == 3 => format!("addi(c,{d},0,subs_limit());"),
@@ -426,6 +446,27 @@ fn local_calls(body: &str, local: &std::collections::HashSet<u32>) -> String {
     out
 }
 
+/// The callees of the `call_local(c,m,0xT,b,fT)?` calls in a block.
+fn direct_targets(body: &str) -> impl Iterator<Item = u32> + '_ {
+    body.match_indices("call_local(c,m,0x").filter_map(|(i, k)| {
+        let hex = body[i + k.len()..].split(',').next()?;
+        u32::from_str_radix(hex, 16).ok()
+    })
+}
+
+/// A part's declarations of the functions it calls in other parts (exported as `lma_f<addr>`).
+fn extern_decls(ext: &BTreeSet<u32>) -> String {
+    if ext.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("unsafe extern \"Rust\" {\n");
+    for t in ext {
+        let _ = writeln!(s, "#[link_name=\"lma_f{t:08x}\"] safe fn f{t:08x}(c:&mut Cpu,m:&mut Memory,pc:u32,b:&mut i64)->Result<u32,Stop>;");
+    }
+    s.push_str("}\n");
+    s
+}
+
 /// Expression for a block-ending branch, evaluating to the next guest pc.
 fn translate_branch(w: u32, pc: u32) -> String {
     let next = pc.wrapping_add(4);
@@ -619,6 +660,14 @@ fn main() {
 
     let (mut native, mut fallback) = (0u64, 0u64);
     let mut funcs: Vec<Func> = Vec::new();
+    // LMA_RECOMP_IR=1 (#145 M1): blocks emitted over host locals by the IR emitter
+    let ir_emit = std::env::var("LMA_RECOMP_IR").as_deref() == Ok("1");
+    // LMA_RECOMP_IR_RANGE=<lo hex>-<hi hex> (bisecting an IR difference): only functions starting in
+    // [lo, hi) use the IR emitter
+    let ir_range = std::env::var("LMA_RECOMP_IR_RANGE").ok().and_then(|v| {
+        let (a, b) = v.split_once('-')?;
+        Some((u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, u32::from_str_radix(b.trim_start_matches("0x"), 16).ok()?))
+    });
     let mut entry_only_total = 0usize;
     for &f in &wanted {
         let Some(&len) = all.get(&f) else { continue };
@@ -640,7 +689,7 @@ fn main() {
         // (code, instruction count, tail expression, falls through into the next leader, the code
         // with a budget check after every instruction: entry-only leaders run like the interpreter,
         // whether it ended in a branch)
-        let mut raw: Vec<(String, u32, String, bool, String, bool)> = Vec::new();
+        let mut raw: Vec<(String, u32, String, bool, String, bool, Vec<(ir::Op, String)>)> = Vec::new();
         for (i, &start) in leaders.iter().enumerate() {
             let stop = leaders.get(i + 1).copied().unwrap_or(end);
             let mut code = String::new();
@@ -648,6 +697,9 @@ fn main() {
             let mut tail = format!("{stop:#x}");
             let mut falls = true;
             let mut stepped = String::new();
+            // the IR emitter's view of the same instructions (#145 M1): the op and, for a helper,
+            // the text it runs through
+            let mut ops: Vec<(ir::Op, String)> = Vec::new();
             for pc in (start..stop).step_by(4) {
                 let w = x.read_u32(pc).unwrap_or(0);
                 count += 1;
@@ -665,11 +717,20 @@ fn main() {
                 if matches!(w >> 26, 2 | 3) {
                     native += 1;
                     let before = code.len();
+                    let mut op = ir::decode(w, pc);
+                    op.kind = ir::Kind::Helper; // the condition natively; a hit leaves through the interpreter
+                    op.defs = ir::Regs::NONE;
+                    ops.push((op, String::new()));
                     let _ = write!(code, "if trap_hit(c,{},{},{},{}){{interp(c,m,{pc:#x},{w:#x})?;}}", bits(w, 6, 10), bits(w, 11, 15), (w & 0xFFFF) as i16 as i64, w >> 26 == 3);
                     let _ = write!(stepped, "{}*b-=1;if *b<=0{{return Ok({:#x})}}", &code[before..], pc + 4);
+                    ops.last_mut().unwrap().1 = code[before..].to_string();
                     continue;
                 }
                 let before = code.len();
+                let mut op = ir::decode(w, pc);
+                if op.kind == ir::Kind::Branch {
+                    op.kind = ir::Kind::Interp; // a trap form outside branch_info: the interpreter
+                }
                 match translate(pc, w) {
                     Some(s) => {
                         native += 1;
@@ -687,8 +748,21 @@ fn main() {
                     }
                 }
                 let _ = write!(stepped, "{}*b-=1;if *b<=0{{return Ok({:#x})}}", &code[before..], pc + 4);
+                let text = code[before..].to_string();
+                if op.kind == ir::Kind::Native && translate(pc, w).is_none() {
+                    op.kind = ir::Kind::Interp; // decoded natively but not translated: stay safe
+                }
+                // a mod patch: the text reads a mod value at run time (base_year() at every year site,
+                // subs and caps at theirs), which the IR's plain op wouldn't: the text, as a helper
+                if op.kind == ir::Kind::Native && MOD_VALUES.iter().any(|f| text.contains(f)) {
+                    op.kind = ir::Kind::Helper;
+                }
+                if op.kind == ir::Kind::Interp && !text.starts_with("interp(") {
+                    op.kind = ir::Kind::Helper; // a helper the IR doesn't know: everything synced around it
+                }
+                ops.push((op, text));
             }
-            raw.push((code, count, tail, falls && stop < end, stepped, !falls));
+            raw.push((code, count, tail, falls && stop < end, stepped, !falls, ops));
         }
         // Extend each block through fall-throughs into the following blocks (up to SUPERBLOCK
         // instructions), so straight-line code entered at many points (e.g. the register
@@ -705,7 +779,7 @@ fn main() {
                 // checked after every instruction, as the interpreter did, so slices end where they
                 // always did (bit-exact); only the per-instruction dispatch is gone
                 loop {
-                    let (_, _, tail, falls, stepped, branched) = &raw[j];
+                    let (_, _, tail, falls, stepped, branched, _) = &raw[j];
                     body.push_str(stepped);
                     if !*falls {
                         // a branch ends the segment (it isn't in `stepped`): charge it, and its check
@@ -725,19 +799,27 @@ fn main() {
                 blocks.push((start, body));
                 continue;
             }
+            let mut segs: Vec<emit::Seg> = Vec::new();
             loop {
-                let (code, count, tail, falls, _, _) = &raw[j];
+                let (code, count, tail, falls, _, _, ops) = &raw[j];
                 body.push_str(code);
                 total += count;
                 if *falls && j + 1 < raw.len() && entry_only.contains(&leaders[j + 1]) {
                     // an entry-only leader: one block before it was split, so no check, no stop
                     let _ = write!(body, "*b-={count};");
+                    segs.push(emit::Seg { ops, count: *count, next: emit::Next::Plain });
                     j += 1;
                 } else if *falls && j + 1 < raw.len() && total + raw[j + 1].1 <= SUPERBLOCK {
                     let _ = write!(body, "*b-={count};if *b<=0{{return Ok({:#x})}}", leaders[j + 1]);
+                    segs.push(emit::Seg { ops, count: *count, next: emit::Next::Check(leaders[j + 1]) });
                     j += 1;
                 } else {
                     let _ = write!(body, "*b-={count};{tail}");
+                    segs.push(emit::Seg { ops, count: *count, next: emit::Next::Tail });
+                    if ir_emit && ir_range.is_none_or(|(lo, hi)| f >= lo && f < hi) {
+                        // the same instructions over host locals (#145 M1)
+                        body = emit::block(&segs, tail);
+                    }
                     break;
                 }
             }
@@ -906,6 +988,16 @@ fn main() {
     let parts_dir = root.join("parts");
     let _ = std::fs::remove_dir_all(&parts_dir);
     let per = funcs.len().div_ceil(parts).max(1);
+    // calls into other parts go straight there too (#6, the maintainer 22 Oct: "a direct call wherever one
+    // works, not the dispatcher"): every function is exported as `lma_f<addr>` and each part
+    // declares the ones it calls (no crate dependencies), so a `bl` anywhere is `call_local` with
+    // the callee itself instead of `call`'s table lookup; same checks, so bit-exact.
+    // LMA_RECOMP_DIRECT=0: crate-local only, as before. Never an import thunk or a hooked function.
+    let callable: std::collections::HashSet<u32> = if std::env::var("LMA_RECOMP_V2").as_deref() != Ok("0") && std::env::var("LMA_RECOMP_DIRECT").as_deref() != Ok("0") {
+        funcs.iter().map(|f| f.start).filter(|a| !thunks.contains(a) && !guest::hooks::ADDRESSES.contains(a)).collect()
+    } else {
+        Default::default()
+    };
     let mut part_names = Vec::new();
     for (pi, chunk) in funcs.chunks(per).enumerate() {
         let name = format!("gb{pi:02}");
@@ -922,7 +1014,7 @@ fn main() {
         let mut src = String::from(
             "//! GENERATED by lma-recomp from the user's own default.xex. Do not edit or redistribute.\n\
              #![allow(unused_variables, unused_mut, unused_parens, unreachable_code, clippy::all)]\n\
-             use guest::cpu::{Cpu, Stop};\nuse guest::mem::Memory;\nuse guest::rec::*;\n\n",
+             use guest::cpu::{Cpu, Stop};\nuse guest::mem::Memory;\nuse guest::rec::*;\nuse guest::native as n;\n\n",
         );
         let mut table = String::from("pub static BLOCKS: &[(u32, FuncFn)] = &[\n");
         // calls to a function in this crate go straight to it (no table lookup)
@@ -937,14 +1029,20 @@ fn main() {
         // the budget in a local the function never lends out (M1, #6): LLVM keeps it in a register
         // instead of a load, subtract and store per block; LMA_RECOMP_BUDGET_LOCAL=0 turns it off
         let budget_local = std::env::var("LMA_RECOMP_BUDGET_LOCAL").as_deref() != Ok("0");
+        // the functions of other parts this one calls directly (declared after the table)
+        let mut ext: BTreeSet<u32> = BTreeSet::new();
         for f in chunk {
+            if !callable.is_empty() {
+                let _ = writeln!(src, "#[export_name=\"lma_f{:08x}\"]", f.start);
+            }
             if budget_local {
                 let _ = writeln!(src, "pub fn f{:08x}(c:&mut Cpu,m:&mut Memory,mut pc:u32,bp:&mut i64)->Result<u32,Stop>{{let mut bv=*bp;let r:Result<u32,Stop>='f:loop{{pc=match pc{{", f.start);
             } else {
                 let _ = writeln!(src, "pub fn f{:08x}(c:&mut Cpu,m:&mut Memory,mut pc:u32,b:&mut i64)->Result<u32,Stop>{{loop{{pc=match pc{{", f.start);
             }
             for (s, body) in &f.blocks {
-                let body = local_calls(body, &local);
+                let body = local_calls(body, if callable.is_empty() { &local } else { &callable });
+                ext.extend(direct_targets(&body).filter(|t| !local.contains(t)));
                 let body = if budget_local { budget_in_local(&body) } else { body };
                 let _ = writeln!(src, "{s:#x}=>{{{body}}}");
                 let _ = writeln!(table, "({s:#x},f{:08x}),", f.start);
@@ -956,6 +1054,7 @@ fn main() {
             }
         }
         table.push_str("];\n");
+        src.push_str(&extern_decls(&ext));
         src.push_str(&table);
         std::fs::write(dir.join("src/lib.rs"), src).unwrap();
         part_names.push(name);
@@ -1088,7 +1187,23 @@ mod tests {
     fn value_unit_sites_translate() {
         assert_eq!(translate(0x8220_e200, 0x1FC3_03E8).as_deref(), Some("mulli(c,30,3,value_unit());"), "mulli r30,r3,1000 after the getter");
         assert_eq!(translate(0x8215_da98, 0x1FE3_03E8).as_deref(), Some("mulli(c,31,3,value_unit());"));
+        assert_eq!(translate(0x8218_83d8, 0x1D7F_0023).as_deref(), Some("mulli(c,11,31,tune(0));"), "a tunable (#870): prime_wage_premium");
+        assert_eq!(translate(0x8218_8ae4, 0x2F0B_0010).as_deref(), Some("cmpi(c,6,false,11,tune(5));"), "a second site of the same number (sale_min_squad)");
+        assert_eq!(translate(0x8218_914c, 0x23CA_00A0).as_deref(), Some("subfic(c,30,10,tune(9) as u64);"), "subfic (bid_pct_top_low)");
+        assert_eq!(translate(0x8218_83dc, 0x1D7F_0023).as_deref(), Some("mulli(c,11,31,35);"), "the same word elsewhere: baked in");
+        assert_eq!(translate(0x8218_83d8, 0x1D7F_0024).as_deref(), Some("mulli(c,11,31,36);"), "another word at the site: baked in");
         assert_eq!(translate(0x8211_dcd8, 0x2F1F_03E8).as_deref(), Some("cmpi(c,6,false,31,value_floor());"), "the setter's cmpwi r31,1000");
+    }
+
+    /// #870: every tunable instruction, at each of its sites, loads its number from `tune(i)`.
+    #[test]
+    fn every_tunable_site_translates_to_its_slot() {
+        for (i, t) in guest::tune::TUNABLES.iter().enumerate().filter(|(_, t)| matches!(t.kind, guest::tune::Kind::Imm(_))) {
+            for (site, word) in guest::tune::sites(t) {
+                let got = translate(site, word).unwrap_or_default();
+                assert!(got.contains(&format!("tune({i})")), "{} at {site:#x}: {got}", t.name);
+            }
+        }
     }
 
     /// #735: the 28-club draw's two compares read the guard; any other cmpwi 28 stays.
@@ -1141,6 +1256,17 @@ mod tests {
         let body = "c.lr=0x82001004;call(c,m,0x82002000,b)?;call(c,m,0x82003000,b)?";
         assert_eq!(local_calls(body, &local), "c.lr=0x82001004;call_local(c,m,0x82002000,b,f82002000)?;call(c,m,0x82003000,b)?");
         assert_eq!(local_calls("call_local(c,m,0x82002000,b,f82002000)?", &local), "call_local(c,m,0x82002000,b,f82002000)?", "already local");
+    }
+
+    #[test]
+    fn cross_part_calls_are_declared() {
+        let all: std::collections::HashSet<u32> = [0x8200_2000, 0x8200_3000].into_iter().collect();
+        let body = local_calls("c.lr=0x82001004;call(c,m,0x82002000,b)?;call(c,m,0x82003000,b)?;call(c,m,0x82004000,b)?", &all);
+        assert_eq!(body, "c.lr=0x82001004;call_local(c,m,0x82002000,b,f82002000)?;call_local(c,m,0x82003000,b,f82003000)?;call(c,m,0x82004000,b)?");
+        let ext: BTreeSet<u32> = direct_targets(&body).filter(|&t| t != 0x8200_2000).collect();
+        assert_eq!(ext, BTreeSet::from([0x8200_3000]));
+        assert_eq!(extern_decls(&ext), "unsafe extern \"Rust\" {\n#[link_name=\"lma_f82003000\"] safe fn f82003000(c:&mut Cpu,m:&mut Memory,pc:u32,b:&mut i64)->Result<u32,Stop>;\n}\n");
+        assert_eq!(extern_decls(&BTreeSet::new()), "");
     }
 
     /// Every instruction the interpreter executes is translated natively (perf plan item 3,

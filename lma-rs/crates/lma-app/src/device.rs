@@ -76,14 +76,21 @@ pub fn track(keys: Res<ButtonInput<KeyCode>>, mouse: Res<ButtonInput<MouseButton
 /// `lma-rs/assets/glyphs/ps5` under the working directory), anything else removes it. The renderer
 /// decodes the glyph textures again on the next frame (`runtime::tex_override`). With
 /// `LMA_TEX_OVERRIDES` set the table is the user's and this leaves it alone.
-pub fn glyphs(kind: Res<InputKind>, mut last: Local<Option<InputKind>>) {
-    if *last == Some(*kind) || std::env::var_os("LMA_TEX_OVERRIDES").is_some() {
+/// Whether the running version gets this port's conveniences (the pad icons following the device):
+/// set by the launcher when the game starts; false only for the original game exactly as shipped
+/// (`launcher::enhanced`). Runs started with arguments keep the default, on.
+pub static ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn glyphs(kind: Res<InputKind>, mut last: Local<Option<(InputKind, bool)>>) {
+    let enhanced = ENHANCED.load(std::sync::atomic::Ordering::Relaxed);
+    if *last == Some((*kind, enhanced)) || std::env::var_os("LMA_TEX_OVERRIDES").is_some() {
         return;
     }
-    *last = Some(*kind);
+    *last = Some((*kind, enhanced));
+    // the original game as shipped keeps its own (Xbox) icons
     let set = match *kind {
-        InputKind::PlayStation => Some("ps5"),
-        InputKind::Keyboard => Some("keyboard"),
+        InputKind::PlayStation if enhanced => Some("ps5"),
+        InputKind::Keyboard if enhanced => Some("keyboard"),
         _ => None,
     };
     let dir = set.and_then(glyphs_dir);
@@ -96,11 +103,21 @@ pub fn glyphs(kind: Res<InputKind>, mut last: Local<Option<InputKind>>) {
 
 /// Where the DualSense glyph PNGs are, if anywhere.
 /// A glyph set's folder (`ps5`, `keyboard`): `LMA_GLYPHS_PS5` / `LMA_GLYPHS_KEYBOARD`, then
-/// `assets/glyphs/<set>` beside the executable (a release), then the checkout's.
-fn glyphs_dir(set: &str) -> Option<std::path::PathBuf> {
+/// `assets/glyphs/<set>` beside the executable or the file a symlink to it names (a release),
+/// then the checkout's.
+pub(crate) fn glyphs_dir(set: &str) -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = std::env::var_os(format!("LMA_GLYPHS_{}", set.to_uppercase())).map(std::path::PathBuf::from).into_iter().collect();
-    if let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-        candidates.push(exe.join("assets").join("glyphs").join(set));
+    // the folder the exe was started from and, through a symlink (the maintainer's launchers link to
+    // builds/<hash>/lma-app; macOS reports the link's path), the one it really is in
+    let exe = std::env::current_exe().ok();
+    for e in [exe.clone(), exe.and_then(|e| std::fs::canonicalize(e).ok())].into_iter().flatten() {
+        if let Some(d) = e.parent() {
+            candidates.push(d.join("assets").join("glyphs").join(set));
+            // LMA.app (macOS): Contents/MacOS/lma-app, the release's assets in Contents/Resources
+            if let Some(contents) = d.parent() {
+                candidates.push(contents.join("Resources").join("assets").join("glyphs").join(set));
+            }
+        }
     }
     candidates.push(std::path::PathBuf::from("lma-rs/assets/glyphs").join(set));
     candidates.into_iter().find(|p| p.is_dir())

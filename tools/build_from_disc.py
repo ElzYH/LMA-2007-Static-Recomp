@@ -78,7 +78,7 @@ def main():
     run([os.path.join(RS, "target", "release", "lma-recomp" + EXE), xex, "all", "crates/game-blocks", "999999", "32"], env=env)
     # the recompiler rewrites the two committed placeholders: keep them out of `git status`, so the
     # game's code can't be committed by accident (parts/ itself is git-ignored)
-    if os.path.isdir(os.path.join(ROOT, ".git")):
+    if os.path.exists(os.path.join(ROOT, ".git")):  # a directory, or a file in a git worktree
         subprocess.run(["git", "update-index", "--skip-worktree", "crates/game-blocks/Cargo.toml", "crates/game-blocks/src/lib.rs"], cwd=RS)
     run(["cargo", "build", "--release", "-p", "lma-cli", "-p", "lma-app"], env=env)
 

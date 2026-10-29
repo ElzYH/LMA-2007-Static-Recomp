@@ -3,18 +3,19 @@
 for exactly one frame.
 
     tools/flash_detect.py <frames dir>
-    tools/flash_detect.py --selftest
 
-<frames dir> holds PNGs named by guest frame number, as lma-app's LMA_FRAME_DIR writes them.
+<frames dir> holds PNGs named by guest frame number, as lma-app's LMA_FRAME_DIR (`0001234.png`) or
+lma-cli's LMA_FRAMES (`frame_01234.png`) writes them.
 Per frame, in the pitch area (rows 15%-82%, below the score and above the captions), it measures
 the share of dark and of bright pixels that aren't grass, and the mean brightness. A frame whose
 measure jumps away from both neighbours in the same direction, while the neighbours agree, is a
 flash. Only runs of consecutive guest frames are compared. Camera cuts and pans change these
 measures smoothly or for good, so they don't count; comparing pixels directly can't tell a pan
-from a flash. Needs numpy and Pillow.
+from a flash. Needs numpy and Pillow. Tests: tools/test_flash_detect.py
 """
 import glob
 import os
+import re
 import sys
 
 import numpy as np
@@ -45,32 +46,15 @@ NAMES = ['dark', 'bright', 'lum', 'grass']
 FLOOR = {'dark': 2, 'bright': 2, 'lum': 5, 'grass': 3}
 
 
-def selftest():
-    """Synthetic frames: a striped pitch panning sideways with players walking across it, and
-    a camera cut; in one frame the players are darker. Only that frame may be flagged."""
-    import tempfile
-    with tempfile.TemporaryDirectory() as d:
-        for n in range(40):
-            x = np.arange(320)[None, :] + 3 * n  # the camera pans 3 px a frame
-            if n >= 25:
-                x = x + 100  # a cut
-            stripes = ((x // 20) % 2).astype(np.uint8) * 25
-            img = np.zeros((180, 320, 3), np.uint8)
-            img[..., 0], img[..., 1], img[..., 2] = 40 + stripes, 120 + stripes, 40 + stripes
-            kit = (60, 50, 20) if n == 17 else (230, 200, 40)  # frame 17: shadowed players
-            for i in range(12):
-                px, py = (25 * i + 2 * n) % 300, 40 + (37 * i) % 90
-                img[py:py + 10, px:px + 4] = kit
-            Image.fromarray(img).save(os.path.join(d, f'{1000 + n:07}.png'))
-        found = run(d)
-    flagged = sorted({n for _, n, *_ in found})
-    assert flagged == [1017], flagged
-    print('selftest ok: only the darkened frame is flagged')
+def frame_number(f):
+    """The guest frame number at the end of the name: lma-app's `0001234.png`, lma-cli's `frame_01234.png`."""
+    m = re.search(r'(\d+)\.png$', os.path.basename(f))
+    return int(m.group(1)) if m else None
 
 
 def run(d):
-    fs = [f for f in sorted(glob.glob(os.path.join(d, '*.png'))) if readable(f)]
-    num = [int(os.path.basename(f)[:-4]) for f in fs]
+    fs = sorted((f for f in glob.glob(os.path.join(d, '*.png')) if frame_number(f) is not None and readable(f)), key=frame_number)
+    num = [frame_number(f) for f in fs]
     s = np.array([stats(f) for f in fs])
     hits = []
     for k in range(1, len(fs) - 1):
@@ -86,8 +70,8 @@ def run(d):
 
 
 def main():
-    if sys.argv[1] == '--selftest':
-        return selftest()
+    if len(sys.argv) != 2 or sys.argv[1].startswith('--'):
+        sys.exit(__doc__)
     hits = run(sys.argv[1])
     print(f'{len(hits)} flashes')
     for score, n, name, a, b, c in sorted(hits, reverse=True)[:30]:

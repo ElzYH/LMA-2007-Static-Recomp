@@ -776,6 +776,12 @@ impl Database {
         }
     }
 
+    /// Manager records: 0..club_count() are the clubs' own (record i = club i's manager), the
+    /// rest are unattached, the managers out of work the game hires from (135 in the 2006 game).
+    pub fn manager_count(&self) -> usize {
+        self.managers.len()
+    }
+
     pub fn manager_surname(&self, i: usize) -> &str {
         let (p, w) = self.layout.mgr_surname;
         &self.surnames.names[self.layout.get(&self.managers[i], p, w) as usize]

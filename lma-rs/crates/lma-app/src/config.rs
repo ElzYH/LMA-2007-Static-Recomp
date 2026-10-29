@@ -10,6 +10,7 @@
 //! render_every = 1        # left out: adaptive frame skip
 //! turbo_until = 4700      # intro in turbo up to 4700 M instructions; 0 off
 //! status_line = false     # the fps/debug line at the top (F2 toggles it; off unless chosen)
+//! battery_saver = "on-battery"  # draw every 2nd frame: "off", "on-battery" (default), "always"
 //!
 //! [keys]                  # keyboard rebinding, see keys.rs
 //! A = ["Enter", "J"]
@@ -55,7 +56,50 @@ pub struct Config {
     /// "shared_pad" (one pad passed between the two: BACK + START or F4 switches); None: off.
     #[serde(default)]
     pub coop: Option<String>,
+    /// F2's Battery saver (None: on battery).
+    #[serde(default)]
+    pub battery_saver: Option<BatterySaver>,
+    /// Render at this many times 1280x720 (F2's Render scale, from the next start; None: 1;
+    /// `LMA_RES_SCALE` wins, #797).
+    #[serde(default)]
+    pub render_scale: Option<u32>,
 }
+
+/// The battery saver (F2): while it is on, the game draws every second frame (30 a second; the
+/// game itself runs at its full rate), which takes a match from about 2.1 cores to 1.3 on an M4.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BatterySaver {
+    Off,
+    /// Only while the computer runs on its battery.
+    #[default]
+    OnBattery,
+    Always,
+}
+
+impl BatterySaver {
+    pub const ALL: [BatterySaver; 3] = [BatterySaver::Off, BatterySaver::OnBattery, BatterySaver::Always];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BatterySaver::Off => "off",
+            BatterySaver::OnBattery => "on battery",
+            BatterySaver::Always => "always",
+        }
+    }
+
+    /// Whether it saves now, given whether the machine is on its battery.
+    pub fn active(self, on_battery: bool) -> bool {
+        match self {
+            BatterySaver::Off => false,
+            BatterySaver::OnBattery => on_battery,
+            BatterySaver::Always => true,
+        }
+    }
+}
+
+/// The largest render scale F2 offers (3: 3840x2160).
+pub const RENDER_SCALE_MAX: u32 = 3;
 
 /// The window sizes F2 offers (16:9, like the game's 1280x720).
 pub const WINDOW_SIZES: [[u32; 2]; 4] = [[1280, 720], [1600, 900], [1920, 1080], [2560, 1440]];
@@ -71,6 +115,14 @@ impl Config {
 
     pub fn volume(&self) -> u8 {
         self.volume.unwrap_or(100).min(100)
+    }
+
+    pub fn battery_saver(&self) -> BatterySaver {
+        self.battery_saver.unwrap_or_default()
+    }
+
+    pub fn render_scale(&self) -> u32 {
+        self.render_scale.unwrap_or(1).clamp(1, RENDER_SCALE_MAX)
     }
 
     /// Whether the status line shows at start: `LMA_STATUS_LINE` (1 on, 0 off) over the saved choice.
@@ -149,7 +201,7 @@ mod tests {
         let path = dir.join("lma-rs").join("config.toml");
         assert_eq!(Config::load_from(&path), Config::default(), "no file: defaults");
         let keys = [("A".to_string(), vec!["Enter".to_string(), "J".to_string()])].into();
-        let c = Config { game_dir: Some(PathBuf::from("/games/LMA_full")), fullscreen: true, mod_space: Some("2025-26".into()), render_every: Some(2), turbo_until: Some(0), keys, status_line: true, vsync: Some(false), window_size: Some([1920, 1080]), volume: Some(40), coop: Some("shared_pad".into()) };
+        let c = Config { game_dir: Some(PathBuf::from("/games/LMA_full")), fullscreen: true, mod_space: Some("2025-26".into()), render_every: Some(2), turbo_until: Some(0), keys, status_line: true, vsync: Some(false), window_size: Some([1920, 1080]), volume: Some(40), coop: Some("shared_pad".into()), battery_saver: Some(BatterySaver::Always), render_scale: Some(2) };
         c.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), c);
         // a file from before `fullscreen` (or `status_line`) existed still loads, the line hidden
@@ -158,9 +210,26 @@ mod tests {
         assert!(!Config::load_from(&path).status_line, "a player sees no debug line unless they chose it");
         let old = Config::load_from(&path);
         assert_eq!((old.vsync(), old.window_size(), old.volume()), (true, [1280, 720], 100), "a file from before #766's settings: vsync on, 1280x720, full volume");
+        assert_eq!(old.battery_saver(), BatterySaver::OnBattery, "the saver works on battery unless turned off");
+        std::fs::write(&path, "battery_saver = \"off\"\n").unwrap();
+        assert_eq!(Config::load_from(&path).battery_saver(), BatterySaver::Off);
         std::fs::write(&path, "not toml [").unwrap();
         assert_eq!(Config::load_from(&path), Config::default(), "unreadable: defaults");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The battery saver's three choices: off never saves, on battery follows the power source,
+    /// always always saves; F2 shows each by its label, and they cycle in this order.
+    #[test]
+    fn the_battery_saver_follows_its_choice() {
+        use BatterySaver::*;
+        for (b, mains, battery) in [(Off, false, false), (OnBattery, false, true), (Always, true, true)] {
+            assert_eq!((b.active(false), b.active(true)), (mains, battery), "{b:?}");
+        }
+        assert_eq!(BatterySaver::ALL.map(BatterySaver::label), ["off", "on battery", "always"]);
+        assert_eq!(BatterySaver::default(), OnBattery);
+        let s = toml::to_string(&Config { battery_saver: Some(OnBattery), ..Default::default() }).unwrap();
+        assert!(s.contains("battery_saver = \"on-battery\""), "{s}");
     }
 
     #[test]

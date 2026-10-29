@@ -4,7 +4,9 @@
 //! 100-280 ms when a cutscene or replay starts) takes sound out of that cushion, and without
 //! refilling it the next stall ran dry (#199: the crowd stuttering in cutscenes; 17 underruns in a
 //! 7-minute session with a fixed cushion). Running dry it resumes once ~100 ms is queued, and it
-//! skips ahead when more than ~500 ms behind (turbo, catch-up).
+//! skips ahead when more than ~500 ms behind (turbo, catch-up). Each of those jumps (cut to silence,
+//! back in, skip) is smoothed over `DECLICK` samples instead of stepping (#868: a click after a
+//! loading screen).
 //!
 //! LMA_AUDIO_NULL=1 plays into nothing at the real rate instead (no device, no sound): the same
 //! playback logic, so tests count underruns without anyone hearing them.
@@ -24,14 +26,18 @@ use std::sync::{Arc, Mutex};
 pub static VOLUME: AtomicU32 = AtomicU32::new(100);
 
 /// Queued samples (48 kHz) above which playback skips ahead, and where it lands.
-const LAG_MAX: usize = 24_000;
-const LAG_TARGET: usize = 14_400;
-/// Playback starts once this much (~250 ms) is queued, and steers the queue back to it, so the
-/// game's usual stalls (cutscene and replay loads) don't reach the speakers.
-const PREBUFFER: usize = 12_000;
+const LAG_MAX: usize = 30_000;
+const LAG_TARGET: usize = 24_000;
+/// Playback starts once this much (~450 ms) is queued, and steers the queue back to it, so the
+/// game's usual stalls (cutscene and replay loads, a career-menu load's ~330 ms: #868, which ran
+/// the old 250 ms dry) don't reach the speakers.
+const PREBUFFER: usize = 21_600;
 /// After running dry, playback resumes once this much (~100 ms) is queued: a short gap, and the
 /// rate steering rebuilds the rest.
 const RESUME: usize = 4_800;
+/// Output samples over which a jump in the signal (running dry, resuming, skipping ahead) is
+/// smoothed: ~2 ms, short enough to keep the timing and long enough not to click.
+const DECLICK: u32 = 96;
 /// The most the playback rate deviates to steer the queue (2%: a third of a semitone).
 const STEER_MAX: f64 = 0.02;
 
@@ -70,24 +76,32 @@ struct Player {
     steer: f64,
     /// the player's volume (`VOLUME`; a test's own in tests)
     volume: &'static AtomicU32,
+    /// the last sample played (before gain and volume), and the step from it to the signal at the
+    /// last jump, faded out over the `declick` samples left
+    last: [f32; 2],
+    jump: [f32; 2],
+    declick: u32,
 }
 
 impl Player {
     fn new(out: Arc<Mutex<VecDeque<[f32; 2]>>>, underruns: Arc<AtomicU64>, step: f64) -> Self {
-        Self { out, underruns, step, pos: 0.0, energy: 0.0, gain: 1.0, primed: false, started: false, steer: STEER_MAX, volume: &VOLUME }
+        Self { out, underruns, step, pos: 0.0, energy: 0.0, gain: 1.0, primed: false, started: false, steer: STEER_MAX, volume: &VOLUME, last: [0.0; 2], jump: [0.0; 2], declick: 0 }
     }
 
     /// Fill one output buffer of `channels`-sample frames.
     fn fill(&mut self, data: &mut [f32], channels: usize) {
         let mut q = self.out.lock().unwrap();
         // more than ~500 ms behind the game (turbo, a long catch-up): skip ahead to ~300 ms
+        let mut jumped = false;
         if q.len() > LAG_MAX {
             let skip = q.len() - LAG_TARGET;
             q.drain(..skip);
+            jumped = true;
         }
         if !self.primed && q.len() >= if self.started { RESUME } else { PREBUFFER } {
             self.primed = true;
             self.started = true;
+            jumped = true;
         }
         // steer towards PREBUFFER queued: slower while below it (refilling the cushion a stall
         // took), faster above it
@@ -99,6 +113,7 @@ impl Player {
             if q.len() < 2 && self.primed {
                 self.primed = false;
                 self.underruns.fetch_add(1, Ordering::Relaxed);
+                jumped = true;
             }
             let s = if self.primed && q.len() >= 2 {
                 let (a, b, t) = (q[0], q[1], self.pos as f32);
@@ -111,6 +126,19 @@ impl Player {
             } else {
                 [0.0; 2]
             };
+            // a jump starts from the last sample played and fades into the signal
+            if std::mem::take(&mut jumped) {
+                self.jump = [self.last[0] - s[0], self.last[1] - s[1]];
+                self.declick = DECLICK;
+            }
+            let s = if self.declick > 0 {
+                let k = self.declick as f32 / DECLICK as f32;
+                self.declick -= 1;
+                [s[0] + self.jump[0] * k, s[1] + self.jump[1] * k]
+            } else {
+                s
+            };
+            self.last = s;
             // ~300 ms mean square, against -3 dBFS RMS: a fault (sustained full-scale noise),
             // not a loud moment of the game (those are limited at the mix already)
             self.energy += ((s[0] * s[0] + s[1] * s[1]) * 0.5 - self.energy) * (1.0 / 14_400.0);
@@ -252,14 +280,14 @@ mod tests {
     /// 48 kHz: step 1), keeps pulling across refills, and at 96 kHz plays each sample twice as long.
     #[test]
     fn native_player_pulls_from_the_mixer() {
-        let mut e = runtime::xact::Engine::new(None, 1 << 20);
+        let e = runtime::xact::Engine::new(None, 1 << 20);
         let pcm = std::sync::Arc::new(runtime::xact::Pcm { channels: 1, rate: 48_000, samples: (0..600).map(|i| (i * 50) as i16).collect() });
         let g = runtime::xact::volume_gain(180) / 32768.0;
-        e.mixer.play(pcm.clone(), 180, 0, 0, None);
+        e.mixer().play(pcm.clone(), 180, 0, 0, None);
         let engine = Arc::new(Mutex::new(e));
         let source = |e: &Arc<Mutex<runtime::xact::Engine>>| -> Source {
             let e = e.clone();
-            Box::new(move |out: &mut [[f32; 2]]| e.lock().unwrap().mixer.mix(out))
+            Box::new(move |out: &mut [[f32; 2]]| e.lock().unwrap().mixer().mix(out))
         };
         let mut p = NativePlayer::new(source(&engine), 1.0);
         let mut out = vec![0f32; 2 * 600];
@@ -268,7 +296,7 @@ mod tests {
             assert!((out[2 * i] - (i * 50) as f32 * g).abs() < 1e-4, "frame {i}: {}", out[2 * i]);
             assert_eq!(out[2 * i], out[2 * i + 1], "mono on both sides");
         }
-        engine.lock().unwrap().mixer.play(pcm, 180, 0, 0, None);
+        engine.lock().unwrap().mixer().play(pcm, 180, 0, 0, None);
         let mut p = NativePlayer::new(source(&engine), 0.5);
         let mut out = vec![0f32; 8];
         p.fill(&mut out, 1);
@@ -286,7 +314,9 @@ mod tests {
         assert!(buf.iter().all(|&s| s == 0.0), "silent until ~250 ms is queued");
         q.lock().unwrap().push_back([0.25, -0.25]);
         p.fill(&mut buf, 2);
-        assert_eq!((buf[0], buf[1]), (0.25, -0.25));
+        assert_eq!((buf[0], buf[1]), (0.0, 0.0), "fades in from silence");
+        let d = 2 * DECLICK as usize;
+        assert_eq!((buf[d], buf[d + 1]), (0.25, -0.25));
         assert_eq!(q.lock().unwrap().len(), PREBUFFER - 480, "at the target: the device's rate");
         // drained: one underrun, then silence until refilled
         let mut big = vec![0f32; 2 * PREBUFFER];
@@ -298,7 +328,7 @@ mod tests {
         assert!(buf.iter().all(|&s| s == 0.0), "waits for ~100 ms");
         q.lock().unwrap().push_back([0.5, 0.5]);
         p.fill(&mut buf, 2);
-        assert_eq!(buf[0], 0.5, "resumes at ~100 ms");
+        assert_eq!(buf[2 * DECLICK as usize], 0.5, "resumes at ~100 ms");
         // below the target it plays slower (2%): the queue refills from the game's steady supply
         let before = q.lock().unwrap().len();
         p.fill(&mut buf, 2);
@@ -326,13 +356,55 @@ mod tests {
         q.lock().unwrap().extend(std::iter::repeat_n([0.4f32, -0.4], PREBUFFER + 2000));
         let mut buf = vec![0f32; 2 * 480];
         p.fill(&mut buf, 2);
-        assert_eq!((buf[0], buf[1]), (0.2, -0.2), "half volume");
+        let d = 2 * DECLICK as usize;
+        assert_eq!((buf[d], buf[d + 1]), (0.2, -0.2), "half volume");
         volume.store(0, Ordering::Relaxed);
         p.fill(&mut buf, 2);
         assert!(buf.iter().all(|&s| s == 0.0), "muted");
         volume.store(250, Ordering::Relaxed);
         p.fill(&mut buf, 2);
         assert_eq!(buf[0], 0.4, "never above full");
+    }
+
+    /// #868: running dry, resuming and skipping ahead never step the output: from one sample to
+    /// the next it moves at most the signal's own step plus 1/DECLICK of the jump.
+    #[test]
+    fn jumps_are_smoothed() {
+        let q = Arc::new(Mutex::new(VecDeque::new()));
+        let mut p = Player::new(q.clone(), Arc::new(AtomicU64::new(0)), 1.0);
+        // a slow sine (the signal's own step is small), at 0.8
+        let mut phase = 0u32;
+        let mut tone = |n: usize| -> Vec<[f32; 2]> {
+            (0..n)
+                .map(|_| {
+                    phase += 1;
+                    let v = 0.8 * (phase as f32 * 0.01).sin();
+                    [v, -v]
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        let mut buf = vec![0f32; 2 * 480];
+        q.lock().unwrap().extend(tone(PREBUFFER + 3000));
+        for _ in 0..40 {
+            // runs dry after ~30 buffers (the start, then running dry)
+            p.fill(&mut buf, 2);
+            out.extend_from_slice(&buf);
+        }
+        q.lock().unwrap().extend(tone(RESUME + 2000)); // resumes mid-wave
+        for _ in 0..3 {
+            p.fill(&mut buf, 2);
+            out.extend_from_slice(&buf);
+        }
+        let mut far = tone(LAG_MAX + 5000);
+        far.iter_mut().skip(1000).for_each(|s| *s = [-s[0], -s[1]]); // a skip lands elsewhere in the wave
+        q.lock().unwrap().extend(far);
+        for _ in 0..3 {
+            p.fill(&mut buf, 2);
+            out.extend_from_slice(&buf);
+        }
+        let worst = out.chunks(2).zip(out.chunks(2).skip(1)).map(|(a, b)| (b[0] - a[0]).abs()).fold(0f32, f32::max);
+        assert!(worst <= 0.8 * 0.0101 + 1.7 / DECLICK as f32, "a step of {worst}");
     }
 
     /// Five minutes of a match where every 20 s a stall costs 150 ms of sound (what a null-output

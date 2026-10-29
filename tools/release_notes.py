@@ -44,6 +44,20 @@ def classify(subject):
     return "The game"
 
 
+def shorten(text, width):
+    """text cut to width: at its last clause break ("; ", ": ", " — ", ", ") in the second half, else
+    at a word, never inside an open bracket, with "..." after a cut mid-clause."""
+    head = text[:width - 3]
+    cut = max((head.rfind(b) for b in ("; ", ": ", " — ", ", ")), default=-1)
+    if cut >= width // 2:
+        head, more = head[:cut], ""
+    else:
+        head, more = head.rsplit(" ", 1)[0], "..."
+    if head.count("(") > head.count(")"):  # an aside cut open: end before it
+        head, more = head[:head.rindex("(")].rstrip(" ,;:"), ""
+    return head.rstrip(" ,;:—") + more
+
+
 def line(subject, width=0):
     """The subject as a note line, ending in its numbers once: "x (#844) (#845)" -> "x (#844, #845)".
     With a width (--short), an overlong subject is cut at a word."""
@@ -53,7 +67,7 @@ def line(subject, width=0):
     if issue:
         text, pr = text[:issue.start()], f"{issue.group(1)[1:]}, #{pr}"
     if width and len(text) > width:
-        text = text[:width - 3].rsplit(" ", 1)[0] + "..."
+        text = shorten(text, width)
     return f"- {text}" + (f" (#{pr})" if pr else "")
 
 
@@ -137,6 +151,12 @@ def main(argv):
         assert classify("LMA_INPUT: an optional :port (1-4) per item, so lma-cli can drive controllers headless (#804)") == "Left out"
         assert line("lma-app: F12 writes a bug report (#816)") == "- lma-app: F12 writes a bug report (#816)"
         assert line("x " * 100 + "(#1)", 120).endswith("... (#1)") and "..." not in line("x " * 100 + "(#1)")
+        long = "lma-app audio: running dry, resuming and skipping ahead fade over ~2 ms instead of stepping (#868: a click after a loading screen)"
+        assert shorten(long, 120) == "lma-app audio: running dry, resuming and skipping ahead fade over ~2 ms instead of stepping", shorten(long, 120)
+        undo = "bench: a queued reserve can be undone before the substitution is confirmed in the menu; his virtual slot keeps the queued state"
+        assert shorten(undo, 120) == "bench: a queued reserve can be undone before the substitution is confirmed in the menu", shorten(undo, 120)
+        assert shorten("ab: " + "w " * 70, 120).endswith("w...")  # no break in the second half: at a word
+        assert len(shorten("y" * 30 + " " + "z " * 100, 120)) <= 120
         assert line("lma-app: battery saver (F2) (#844) (#845)") == "- lma-app: battery saver (F2) (#844, #845)"
         assert line("Fence wait (#312, #6) (#810)") == "- Fence wait (#312, #6, #810)"
         assert line("xact (#772 step 1) (#778)") == "- xact (#772 step 1) (#778)"

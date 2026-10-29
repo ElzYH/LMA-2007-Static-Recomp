@@ -800,6 +800,62 @@ impl Memory {
         self.page(a)[(a as usize) & (PAGE - 1)] = v;
     }
 
+    /// The flat mapping's base, for `read32_b` and friends (null without one). The IR emitter
+    /// reads it once per block (#145): LLVM can't prove a guest store leaves `Memory` itself
+    /// alone, so through `self` it reloads the base before every access.
+    #[inline(always)]
+    pub fn base_ptr(&self) -> *mut u8 {
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
+        return self.base;
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
+        std::ptr::null_mut()
+    }
+    /// `fast` with the base passed in (`base_ptr`): the same bounds and bytes; None elsewhere
+    /// (the plain accessor then takes its own path).
+    #[inline(always)]
+    fn fast_b<const N: usize>(base: *mut u8, a: u32) -> Option<*mut [u8; N]> {
+        #[cfg(all(any(target_vendor = "apple", target_os = "linux", target_os = "android"), not(feature = "rwatch")))]
+        if a <= 0xE000_0000 - N as u32 {
+            // SAFETY: a + N <= 0xE0000000, inside the 4 GB mapping `base` starts
+            return Some(unsafe { base.add(a as usize).cast::<[u8; N]>() });
+        }
+        let _ = (base, a);
+        None
+    }
+    // SAFETY (all `_b` accessors): fast_b's pointer lies inside the mapping
+    #[inline(always)]
+    pub fn read8_b(&mut self, base: *mut u8, a: u32) -> u8 {
+        match Self::fast_b::<1>(base, a) { Some(p) => unsafe { (*p)[0] }, None => self.read8(a) }
+    }
+    #[inline(always)]
+    pub fn read16_b(&mut self, base: *mut u8, a: u32) -> u16 {
+        match Self::fast_b::<2>(base, a) { Some(p) => u16::from_be_bytes(unsafe { *p }), None => self.read16(a) }
+    }
+    #[inline(always)]
+    pub fn read32_b(&mut self, base: *mut u8, a: u32) -> u32 {
+        match Self::fast_b::<4>(base, a) { Some(p) => u32::from_be_bytes(unsafe { *p }), None => self.read32(a) }
+    }
+    #[inline(always)]
+    pub fn read64_b(&mut self, base: *mut u8, a: u32) -> u64 {
+        match Self::fast_b::<8>(base, a) { Some(p) => u64::from_be_bytes(unsafe { *p }), None => self.read64(a) }
+    }
+    #[inline(always)]
+    pub fn write8_b(&mut self, base: *mut u8, a: u32, v: u8) {
+        match Self::fast_b::<1>(base, a) { Some(p) => unsafe { (*p)[0] = v }, None => self.write8(a, v) }
+    }
+    #[inline(always)]
+    pub fn write16_b(&mut self, base: *mut u8, a: u32, v: u16) {
+        match Self::fast_b::<2>(base, a) { Some(p) => unsafe { *p = v.to_be_bytes() }, None => self.write16(a, v) }
+    }
+    #[inline(always)]
+    pub fn write32_b(&mut self, base: *mut u8, a: u32, v: u32) {
+        match Self::fast_b::<4>(base, a) { Some(p) => unsafe { *p = v.to_be_bytes() }, None => self.write32(a, v) }
+    }
+    #[inline(always)]
+    pub fn write64_b(&mut self, base: *mut u8, a: u32, v: u64) {
+        match Self::fast_b::<8>(base, a) { Some(p) => unsafe { *p = v.to_be_bytes() }, None => self.write64(a, v) }
+    }
+
     /// The bytes [a, a+N) when they lie inside one mapped host page: the common case, inlined
     /// into the recompiled code. Within one translated 64 KB page every alias is linear, so this
     /// agrees with `contiguous`; anything else (page crossing, unmapped page) takes `read`/`write`.
@@ -1078,16 +1134,32 @@ impl Memory {
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
     pub fn snapshot_pages(&self) -> Vec<(u32, Vec<u8>)> {
         let touched = self.flat.touched();
-        (0..PAGES)
+        let pages: Vec<usize> = (0..PAGES)
             .filter(|&i| touched[i])
             // the alias shows the same pages as 0xA0000000.. (Apple): saved once, there
             .filter(|&i| !cfg!(any(target_vendor = "apple", target_os = "linux", target_os = "android")) || !Self::is_alias(i))
-            .filter_map(|i| {
-                // SAFETY: a page inside the mapping
-                let b = unsafe { std::slice::from_raw_parts(self.base.add(i * PAGE), PAGE) };
-                b.iter().any(|&x| x != 0).then(|| (i as u32, b.to_vec()))
-            })
-            .collect()
+            .collect();
+        // copied on several threads (the black box saves while the game waits: ~1 s on one for
+        // ~400 MB), in page order
+        let base = self.base as usize;
+        let chunk = pages.len().div_ceil(8).max(1);
+        std::thread::scope(|sc| {
+            let parts: Vec<_> = pages
+                .chunks(chunk)
+                .map(|part| {
+                    sc.spawn(move || {
+                        part.iter()
+                            .filter_map(|&i| {
+                                // SAFETY: a page inside the mapping, which outlives the scope
+                                let b = unsafe { std::slice::from_raw_parts((base as *const u8).add(i * PAGE), PAGE) };
+                                b.iter().any(|&x| x != 0).then(|| (i as u32, b.to_vec()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            parts.into_iter().flat_map(|h| h.join().expect("a page copy panicked")).collect()
+        })
     }
 
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]

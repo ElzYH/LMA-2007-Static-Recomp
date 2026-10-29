@@ -7,6 +7,7 @@
 
 use crate::cpu::{Cpu, Stop};
 use crate::mem::Memory;
+pub use crate::tune::tune;
 
 /// A recompiled guest function: enter at `pc`, run until control leaves the function or the
 /// instruction `budget` runs out, return the next guest pc.

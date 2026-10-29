@@ -7,5 +7,7 @@ pub mod cpu;
 pub mod hooks;
 pub mod mem;
 pub mod mmio;
+pub mod native;
 pub mod rec;
+pub mod tune;
 pub mod vmx;

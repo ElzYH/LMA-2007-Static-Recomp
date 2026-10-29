@@ -12,7 +12,7 @@ it, so every system doesn't reach the whole game. A hook counts its function onl
 replacement alike), so the % is a lower bound on what is native and an upper bound on what is
 rewritten; it is the first number to watch, not the last.
 
-Selftest: tools/native_progress.py --selftest
+Tests: tools/test_native_progress.py
 """
 import argparse
 import bisect
@@ -198,39 +198,6 @@ def report(funcs, calls, callers, native, shared, files=lambda pats: set(), tune
     return rows, len(funcs), len(native & funcs), len(helpers)
 
 
-def selftest():
-    calls = {1: {2, 3}, 2: {4}, 3: {4, 9}, 4: set(), 9: set(), 5: {9}, 6: {9}}
-    callers = collections.Counter()
-    for a, bs in calls.items():
-        for b in bs:
-            callers[b] += 1
-    got, stopped = reach({1}, calls, callers, 3)
-    assert got == {1, 2, 3, 4} and stopped == {9}, (got, stopped)
-    got, _ = reach({9}, calls, callers, 3)
-    assert got == {9}, "an entry point is never a stop"
-    src = "pub const ADDRESSES: &[u32] = &[0x8233_98A0, 0x820E_39D8];\n"
-    p = "/tmp/native_progress_selftest.rs" if os.name != "nt" else os.path.join(os.environ.get("TEMP", "."), "np.rs")
-    open(p, "w").write(src)
-    assert hook_sites(p) == {0x823398A0, 0x820E39D8}
-    starts, sizes = [0x100, 0x200], {0x100: 0x40, 0x200: 0x10}
-    assert (owner(starts, sizes, 0x13c), owner(starts, sizes, 0x140), owner(starts, sizes, 0x204)) == (0x100, None, 0x200)
-    os.remove(p)
-    # pointer edges: 0x100 takes 0x200's address and a vtable's (0x900: 0x300, 0x400); a data word
-    # that isn't a table start (0x904) only through the table
-    import tempfile
-    d = tempfile.mkdtemp()
-    open(os.path.join(d, "xrefs.tsv"), "w").write("from\tto\ttype\n8100\t8200\tPARAM\n8104\t8900\tDATA\n8900\t8300\tDATA\n8904\t8400\tDATA\n8108\t8500\tUNCONDITIONAL_CALL\n")
-    sizes = {0x8100: 0x10, 0x8200: 4, 0x8300: 4, 0x8400: 4, 0x8500: 4}
-    assert sorted(pointer_edges(d, set(sizes), sizes)) == [(0x8100, 0x8200), (0x8100, 0x8300), (0x8100, 0x8400)]
-    # [tune] names: an instruction's function, a table's readers
-    open(os.path.join(d, "tune.rs"), "w").write('name: "a", kind: Kind::Imm(0x3860_0001), site: 0x8104\nname: "b", kind: Kind::Table(1), site: 0x8900\nname: "c", kind: Kind::F32, site: 0x7000\n')
-    t = tune_sites(os.path.join(d, "tune.rs"), d, sizes)
-    assert t == [("a", {0x8100}), ("b", {0x8100}), ("c", set())], t
-    import shutil
-    shutil.rmtree(d)
-    print("selftest ok")
-
-
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -240,10 +207,7 @@ def main():
     ap.add_argument("--markdown", action="store_true", help="a table for docs/NATIVE_GAME.md")
     ap.add_argument("--tune", default=os.path.join(here, "..", "lma-rs", "crates", "guest", "src", "tune.rs"), help="guest/src/tune.rs: count each system's [tune] names")
     ap.add_argument("--no-pointers", action="store_true", help="the call graph only (no function-pointer and vtable edges)")
-    ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
-    if a.selftest:
-        return selftest()
     funcs, calls, callers, sizes = load_export(a.export, not a.no_pointers)
     tune = tune_sites(a.tune, a.export, sizes) if os.path.exists(a.tune) else []
     rows, total, native_total, helpers = report(funcs, calls, callers, hook_sites(a.hooks), a.shared, lambda pats: file_entries(a.export, sizes, pats), tune)

@@ -68,7 +68,8 @@ def main():
     season = int(args[1]) if len(args) > 1 else 0
     max_rounds = next((int(f.split("=", 1)[1]) for f in flags if f.startswith("--rounds=")), 40)
     show_records = "--records" in flags
-    outer = parse_bg2(open(args[0], "rb").read())
+    with open(args[0], "rb") as f:
+        outer = parse_bg2(f.read())
     inner = parse_bg2(outer["Diary20.mng"])
     year = 2006 + season
     tw = struct.unpack(">27I", inner[f"TW{season:04}.bin"])

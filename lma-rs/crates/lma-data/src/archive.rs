@@ -46,6 +46,11 @@ impl Archive {
         Ok(Self { data_start, endian: e, entries })
     }
 
+    /// A new archive of `entries` (built with the smallest data start).
+    pub fn new(endian: Endian, entries: Vec<(String, Vec<u8>)>) -> Self {
+        Self { data_start: 0, endian, entries }
+    }
+
     pub fn get(&self, name: &str) -> Option<&[u8]> {
         self.entries.iter().find(|(n, _)| n == name).map(|(_, d)| d.as_slice())
     }

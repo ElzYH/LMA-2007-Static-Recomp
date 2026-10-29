@@ -36,6 +36,23 @@ const LOOP_BASE: usize = 0x4908;
 
 /// Every EDRAM surface becomes a texture this big (enough for 1280x720 plus tiling offsets).
 const SURFACE: u32 = 2048;
+pub use crate::gpu::res_scale;
+
+/// A guest-pixel rectangle (x, y, w, h) on a surface at resolution scale `k`.
+fn scaled_rect(x: u32, y: u32, w: u32, h: u32, k: u32) -> [u32; 4] {
+    [x * k, y * k, w * k, h * k]
+}
+
+/// The fetch constants a setup binds to a resolve kept on the GPU (ids with bit 63, see
+/// `ps_setup_textures`), as a bit mask: at resolution scale n those textures have n times the
+/// guest's size, which an unnormalized fetch must divide out (`Consts::scaled`). 0 at 1x.
+fn scaled_mask(setup: &Setup) -> u32 {
+    if res_scale() == 1 {
+        return 0;
+    }
+    setup.1.iter().filter(|&&(k, id, _)| id >> 63 == 1 && k < 32).fold(0, |m, &(k, _, _)| m | 1 << k)
+}
+
 /// Flushes whose upload buffers are kept apart (see `WgpuBackend::upload_ring`).
 const UPLOAD_RING: usize = 3;
 /// Front-buffer read-backs in flight at most (`WgpuBackend::present_pending`), the only bound on
@@ -132,7 +149,7 @@ struct Out {
 /// colour, or depth as 24_8), as raster::Renderer::resolve writes them. `dst` starts as the
 /// current guest bytes, so texels outside the rectangle keep their values.
 const RESOLVE_CS: &str = r#"
-struct P { x0: u32, y0: u32, x1: u32, y1: u32, dpitch: u32, dheight: u32, pitch_aligned: u32, endian: u32, swap_rb: u32, _a: u32, _b: u32, _c: u32 };
+struct P { x0: u32, y0: u32, x1: u32, y1: u32, dpitch: u32, dheight: u32, pitch_aligned: u32, endian: u32, swap_rb: u32, scale: u32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var src: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<u32>;
@@ -166,26 +183,40 @@ fn dst_index(id: vec3<u32>) -> i32 {
 @compute @workgroup_size(8, 8) fn color(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = dst_index(id);
     if (i < 0) { return; }
-    var c = textureLoad(src, vec2<i32>(i32(p.x0 + id.x), i32(p.y0 + id.y)), 0);
-    if (p.swap_rb != 0u) { c = vec4<f32>(c.z, c.y, c.x, c.w); } // copy_dest_swap
-    let word = pack4x8unorm(c);
-    dst[i] = gpu_swap(word, p.endian);
-    // what raster::texel_with decodes from these bytes (k_8_8_8_8: byte / 255 per channel)
+    // at resolution scale s the surface has s x s texels per guest pixel: guest memory gets the
+    // top-left one, the texture kept on the GPU all of them (`res_scale`)
+    let s = p.scale;
     let d = textureDimensions(decoded_out);
-    if (id.x < d.x && id.y < d.y) {
-        textureStore(decoded_out, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(f32(word & 0xFFu), f32((word >> 8u) & 0xFFu), f32((word >> 16u) & 0xFFu), f32(word >> 24u)) / 255.0);
+    for (var sy = 0u; sy < s; sy++) {
+        for (var sx = 0u; sx < s; sx++) {
+            var c = textureLoad(src, vec2<i32>(i32((p.x0 + id.x) * s + sx), i32((p.y0 + id.y) * s + sy)), 0);
+            if (p.swap_rb != 0u) { c = vec4<f32>(c.z, c.y, c.x, c.w); } // copy_dest_swap
+            let word = pack4x8unorm(c);
+            if (sx == 0u && sy == 0u) { dst[i] = gpu_swap(word, p.endian); }
+            // what raster::texel_with decodes from these bytes (k_8_8_8_8: byte / 255 per channel)
+            let o = vec2<u32>(id.x * s + sx, id.y * s + sy);
+            if (o.x < d.x && o.y < d.y) {
+                textureStore(decoded_out, vec2<i32>(o), vec4<f32>(f32(word & 0xFFu), f32((word >> 8u) & 0xFFu), f32((word >> 16u) & 0xFFu), f32(word >> 24u)) / 255.0);
+            }
+        }
     }
 }
 @compute @workgroup_size(8, 8) fn depth(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = dst_index(id);
     if (i < 0) { return; }
-    let z = textureLoad(src_depth, vec2<i32>(i32(p.x0 + id.x), i32(p.y0 + id.y)), 0);
-    let q = min(u32(clamp(z, 0.0, 1.0) * 16777215.0 + 0.5), 16777215u); // 1.0 rounds to 2^24 in f32
-    dst[i] = gpu_swap(q << 8u, p.endian);
-    // what raster::texel_with decodes from these bytes (k_24_8: depth / 0xFFFFFF in every channel)
+    let s = p.scale;
     let d = textureDimensions(decoded_out);
-    if (id.x < d.x && id.y < d.y) {
-        textureStore(decoded_out, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(f32(q) / 16777215.0));
+    for (var sy = 0u; sy < s; sy++) {
+        for (var sx = 0u; sx < s; sx++) {
+            let z = textureLoad(src_depth, vec2<i32>(i32((p.x0 + id.x) * s + sx), i32((p.y0 + id.y) * s + sy)), 0);
+            let q = min(u32(clamp(z, 0.0, 1.0) * 16777215.0 + 0.5), 16777215u); // 1.0 rounds to 2^24 in f32
+            if (sx == 0u && sy == 0u) { dst[i] = gpu_swap(q << 8u, p.endian); }
+            // what raster::texel_with decodes from these bytes (k_24_8: depth / 0xFFFFFF in every channel)
+            let o = vec2<u32>(id.x * s + sx, id.y * s + sy);
+            if (o.x < d.x && o.y < d.y) {
+                textureStore(decoded_out, vec2<i32>(o), vec4<f32>(f32(q) / 16777215.0));
+            }
+        }
     }
 }
 "#;
@@ -229,6 +260,24 @@ fn pick(c: vec4<f32>, s: u32) -> f32 {
     textureStore(dst, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(pick(c, s & 7u), pick(c, (s >> 3u) & 7u), pick(c, (s >> 6u) & 7u), pick(c, (s >> 9u) & 7u)));
 }
 "#;
+
+/// RESOLVE_CS reading 2x multisampled surfaces: colour averages the samples (as the console's
+/// resolve does), depth takes sample 0. Each pattern must still be in RESOLVE_CS.
+fn resolve_cs_msaa() -> String {
+    [
+        ("var src: texture_2d<f32>;", "var src: texture_multisampled_2d<f32>;"),
+        ("var src_depth: texture_depth_2d;", "var src_depth: texture_depth_multisampled_2d;"),
+        (
+            "var c = textureLoad(src, vec2<i32>(i32((p.x0 + id.x) * s + sx), i32((p.y0 + id.y) * s + sy)), 0);",
+            "let q = vec2<i32>(i32((p.x0 + id.x) * s + sx), i32((p.y0 + id.y) * s + sy));\n            var c = (textureLoad(src, q, 0) + textureLoad(src, q, 1)) * 0.5;",
+        ),
+    ]
+    .iter()
+    .fold(RESOLVE_CS.to_string(), |src, (from, to)| {
+        assert!(src.contains(from), "resolve_cs_msaa: {from:?} is not in RESOLVE_CS");
+        src.replace(from, to)
+    })
+}
 
 /// Present from the GPU: the front buffer's resolves (decoded values, see RESOLVE_CS; the game
 /// may resolve it in several parts, each a band of rows) with fetch constant 0's swizzle, packed
@@ -279,6 +328,11 @@ type VsModule = (wgpu::ShaderModule, Vec<u32>, Option<Vec<u32>>, u16);
 fn make_ps(device: &wgpu::Device, code: &[u32]) -> PsModule {
     let shader = Arc::new(Shader::new(code.to_vec()));
     let t = crate::shader_wgsl::translate(&shader, crate::shader_wgsl::Stage::Pixel);
+    // an unnormalized fetch divides by the bound texture's size, n times the guest's on a resolve
+    // kept on the GPU at resolution scale n: log the shaders that have one (#797)
+    if res_scale() > 1 && t.wgsl.contains("textureDimensions(tex") {
+        eprintln!("LMA_RES_SCALE: pixel shader {:016x} has an unnormalized texture fetch", fast_hash_u32(code));
+    }
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("xenos ps"), source: wgpu::ShaderSource::Wgsl(t.wgsl.into()) });
     (module, t.textures, shader, t.const_slots)
 }
@@ -1673,18 +1727,7 @@ impl WgpuBackend {
         });
         let (depth_fill, depth_fill2) = (depth_fill_n(1), depth_fill_n(if msaa2 { 2 } else { 1 }));
         let resolve_cs = module("resolve", RESOLVE_CS);
-        // the same reading 2x multisampled surfaces: colour averages the samples (as the
-        // console's resolve does), depth takes sample 0
-        let resolve_cs2 = module(
-            "resolve",
-            &RESOLVE_CS
-                .replace("var src: texture_2d<f32>;", "var src: texture_multisampled_2d<f32>;")
-                .replace("var src_depth: texture_depth_2d;", "var src_depth: texture_depth_multisampled_2d;")
-                .replace(
-                    "var c = textureLoad(src, vec2<i32>(i32(p.x0 + id.x), i32(p.y0 + id.y)), 0);",
-                    "let q = vec2<i32>(i32(p.x0 + id.x), i32(p.y0 + id.y));\n    var c = (textureLoad(src, q, 0) + textureLoad(src, q, 1)) * 0.5;",
-                ),
-        );
+        let resolve_cs2 = module("resolve", &resolve_cs_msaa());
         let (resolve_color2, resolve_depth2) = (
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("resolve 2x"), layout: None, module: &resolve_cs2, entry_point: Some("color"), compilation_options: Default::default(), cache: None }),
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("resolve 2x"), layout: None, module: &resolve_cs2, entry_point: Some("depth"), compilation_options: Default::default(), cache: None }),
@@ -1814,7 +1857,7 @@ impl WgpuBackend {
             let samples = key_samples(base);
             let color = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("edram colour"),
-                size: wgpu::Extent3d { width: SURFACE, height: SURFACE, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d { width: SURFACE * res_scale(), height: SURFACE * res_scale(), depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: samples,
                 dimension: wgpu::TextureDimension::D2,
@@ -1839,7 +1882,7 @@ impl WgpuBackend {
         if !self.depths.contains_key(&key) {
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("edram depth"),
-                size: wgpu::Extent3d { width: SURFACE, height: SURFACE, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d { width: SURFACE * res_scale(), height: SURFACE * res_scale(), depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: key_samples(base),
                 dimension: wgpu::TextureDimension::D2,
@@ -1870,9 +1913,11 @@ impl WgpuBackend {
         if w == 0 || h == 0 {
             return;
         }
-        let mut bytes = Vec::with_capacity((w * h * s.format.bytes()) as usize);
-        for y in y0..y1 {
-            for x in x0..x1 {
+        // each texel s x s times at resolution scale s
+        let k = res_scale();
+        let mut bytes = Vec::with_capacity((w * h * k * k * s.format.bytes()) as usize);
+        for y in (y0 * k..y1 * k).map(|y| y / k) {
+            for x in (x0 * k..x1 * k).map(|x| x / k) {
                 let c = self.soft.edram[self.soft.edram_index(base, pitch, x, y)];
                 match s.format {
                     Fmt::Rgba8 => bytes.extend(c.map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)),
@@ -1885,10 +1930,10 @@ impl WgpuBackend {
             }
         }
         self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &s.color, mip_level: 0, origin: wgpu::Origin3d { x: x0, y: y0, z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &s.color, mip_level: 0, origin: wgpu::Origin3d { x: x0 * k, y: y0 * k, z: 0 }, aspect: wgpu::TextureAspect::All },
             &bytes,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * s.format.bytes()), rows_per_image: Some(h) },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * k * s.format.bytes()), rows_per_image: Some(h * k) },
+            wgpu::Extent3d { width: w * k, height: h * k, depth_or_array_layers: 1 },
         );
     }
 
@@ -1901,16 +1946,18 @@ impl WgpuBackend {
         self.flush();
         // Depth32Float can't be a copy destination: put the values in an R32Float texture and
         // draw a full-screen pass that writes them as fragment depth.
-        let mut bytes = Vec::with_capacity((SURFACE * SURFACE * 4) as usize);
-        for y in 0..SURFACE {
-            for x in 0..SURFACE {
-                let z = self.soft.depth[self.soft.edram_index(base, pitch, x, y)];
+        let k = res_scale();
+        let n = SURFACE * k;
+        let mut bytes = Vec::with_capacity((n * n * 4) as usize);
+        for y in 0..n {
+            for x in 0..n {
+                let z = self.soft.depth[self.soft.edram_index(base, pitch, x / k, y / k)];
                 bytes.extend(z.to_le_bytes());
             }
         }
         let src = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("depth upload"),
-            size: wgpu::Extent3d { width: SURFACE, height: SURFACE, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1921,8 +1968,8 @@ impl WgpuBackend {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &bytes,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SURFACE * 4), rows_per_image: Some(SURFACE) },
-            wgpu::Extent3d { width: SURFACE, height: SURFACE, depth_or_array_layers: 1 },
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 4), rows_per_image: Some(n) },
+            wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
         );
         let src_view = src.create_view(&Default::default());
         let layout = self.depth_upload.get_bind_group_layout(0);
@@ -1982,7 +2029,8 @@ impl WgpuBackend {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_scissor_rect(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]);
+            let [x, y, w, h] = scaled_rect(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1], res_scale());
+            pass.set_scissor_rect(x, y, w, h);
             pass.set_pipeline(if key_samples(base) > 1 { &self.depth_fill2 } else { &self.depth_fill });
             pass.set_vertex_buffer(0, vbuf.slice(..));
             pass.draw(0..3, 0..1);
@@ -2005,8 +2053,10 @@ impl WgpuBackend {
             let Some(d) = self.depths.get(&(base, pitch)) else { return };
             (&d.tex, 4, wgpu::TextureAspect::DepthOnly, None)
         };
-        // depth textures can only be copied whole: copy everything, read the rectangle
-        let (cx, cy, cw, ch) = if color { (x0, y0, w, h) } else { (0, 0, SURFACE, SURFACE) };
+        // depth textures can only be copied whole: copy everything, read the rectangle (at
+        // resolution scale k, the top-left texel of each guest pixel)
+        let k = res_scale();
+        let (cx, cy, cw, ch) = if color { (x0 * k, y0 * k, w * k, h * k) } else { (0, 0, SURFACE * k, SURFACE * k) };
         let row = (cw * bpp).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (row * ch) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -2024,7 +2074,7 @@ impl WgpuBackend {
         let data = slice.get_mapped_range();
         for yy in 0..h {
             for xx in 0..w {
-                let o = ((yy + y0 - cy) * row + (xx + x0 - cx) * bpp) as usize;
+                let o = (((yy + y0) * k - cy) * row + ((xx + x0) * k - cx) * bpp) as usize;
                 let idx = self.soft.edram_index(base, pitch, x0 + xx, y0 + yy);
                 match fmt {
                     Some(Fmt::Rgba8) => self.soft.edram[idx] = std::array::from_fn(|k| data[o + k] as f32 / 255.0),
@@ -2324,7 +2374,7 @@ impl WgpuBackend {
     #[allow(clippy::too_many_arguments)]
     /// The draw's constant block, on the stack (a heap Vec per draw was part of the render
     /// thread's allocation cost, #304).
-    fn consts(regs: &[u32], ctx: &RasterCtx, vmem_base: u32, fetch_idx: u32, vmem: (u32, u32), f_off: (u32, u32)) -> [u8; CONSTS_SIZE] {
+    fn consts(regs: &[u32], ctx: &RasterCtx, vmem_base: u32, fetch_idx: u32, vmem: (u32, u32), f_off: (u32, u32), scaled: u32) -> [u8; CONSTS_SIZE] {
         let mut out = [0u8; CONSTS_SIZE];
         let mut n = 0;
         let mut put = |v: u32| {
@@ -2345,7 +2395,7 @@ impl WgpuBackend {
         for f in [vp[0], vp[1], vp[2], vp[3], vp[4], vp[5], ctx.pix_offset, 0.0, ctx.offset[0], ctx.offset[1], 1.0 / half, 1.0 / half] {
             put(f.to_bits());
         }
-        for v in [f_off.0, f_off.1, 0, 0] {
+        for v in [f_off.0, f_off.1, scaled, 0] {
             put(v);
         }
         debug_assert_eq!(n, CONSTS_SIZE);
@@ -2740,13 +2790,13 @@ impl WgpuBackend {
             self.flush();
             self.batch.target = Some(target);
         }
-        Some([sx0, sy0, sx1 - sx0, sy1 - sy0])
+        Some(scaled_rect(sx0, sy0, sx1 - sx0, sy1 - sy0, res_scale()))
     }
 
     /// The draw's constants in the storage arena (shared with the previous draw when equal).
     /// This draw's constants record (shared with any earlier draw of the batch with equal bytes).
     #[allow(clippy::too_many_arguments)]
-    fn put_consts(&mut self, regs: &[u32], ctx: &RasterCtx, vmem_base: u32, fetch_idx: u32, vmem: (u32, u32), vs_hash: u64, ps_hash: u64) -> u32 {
+    fn put_consts(&mut self, regs: &[u32], ctx: &RasterCtx, vmem_base: u32, fetch_idx: u32, vmem: (u32, u32), vs_hash: u64, ps_hash: u64, setup: &Setup) -> u32 {
         // borrowed, not cloned (two allocations per draw)
         let b = &mut self.batch;
         // float constants written since the last draw that got here (draws that stop earlier keep
@@ -2755,7 +2805,7 @@ impl WgpuBackend {
         let vf = self.vs_modules.get(&vs_hash).map_or(0, |m| b.put_floats(regs, 0, m.2.as_deref()));
         let pf = self.ps_modules.get(&ps_hash).map_or(0, |m| b.put_floats(regs, 256, m.3.as_deref()));
         b.floats_clean = [false; 2];
-        let bytes = Self::consts(regs, ctx, vmem_base, fetch_idx, vmem, (vf, pf));
+        let bytes = Self::consts(regs, ctx, vmem_base, fetch_idx, vmem, (vf, pf), scaled_mask(setup));
         let hash = fast_hash(bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
         let b = &mut self.batch;
         Batch::intern(&mut b.consts, &mut b.consts_by_hash, hash, &bytes)
@@ -2803,7 +2853,7 @@ impl WgpuBackend {
         let imask = if self.trim.is_some() { tris.iter().flat_map(|t| t.v.iter()).fold(0u16, |m, v| (0..16).filter(|&d| v.interp[d].iter().any(|x| x.to_bits() != 0)).fold(m, |m, d| m | 1 << d)) } else { 0 };
         let key = PipelineKey { samples: key_samples(self.surface_key(0, regs)), imask, ..Self::key(&ctx, regs, 0, 0, ps_hash, depth_only) };
         self.pipeline(key);
-        let di = (ps_hash != 0).then(|| self.put_consts(regs, &ctx, 0, 0, (0, 0), 0, ps_hash));
+        let di = (ps_hash != 0).then(|| self.put_consts(regs, &ctx, 0, 0, (0, 0), 0, ps_hash, &textures));
         let uses_f = self.ps_modules.get(&ps_hash).is_some_and(|m| m.3.as_ref().is_none_or(|l| !l.is_empty()));
         let first = (self.batch.verts.len() / (VERTEX_FLOATS * 4)) as u32;
         self.batch.verts.extend(data.iter().flat_map(|f| f.to_le_bytes()));
@@ -2900,7 +2950,7 @@ impl WgpuBackend {
         drop(_vw);
         let di = {
             let _p = crate::prof::span(crate::prof::Cat::RtConsts);
-            Some(self.put_consts(regs, &ctx, vmem_base, fetch_idx, vmem, vs_hash, ps_hash))
+            Some(self.put_consts(regs, &ctx, vmem_base, fetch_idx, vmem, vs_hash, ps_hash, &textures))
         };
         let _rec = crate::prof::span(crate::prof::Cat::RtRecord);
         let uses = |sl: Option<&Option<Vec<u32>>>| sl.is_some_and(|s| s.as_ref().is_none_or(|l| !l.is_empty()));
@@ -3211,13 +3261,13 @@ impl WgpuBackend {
                 return Some(v.clone());
             }
             let view = c.view.clone();
-            let v = self.swizzle(&view, t.width, t.height, swz);
+            let v = self.swizzle(&view, t.width * res_scale(), t.height * res_scale(), swz);
             self.composed.get_mut(&base).unwrap().swizzled.insert(swz, v.clone());
             return Some(v);
         }
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("resolved texture (composed)"),
-            size: wgpu::Extent3d { width: t.width, height: t.height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: t.width * res_scale(), height: t.height * res_scale(), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -3232,10 +3282,11 @@ impl WgpuBackend {
             let r = &self.resolved[&d];
             let row = (d - base) / row_bytes;
             let rows = r.h.min(t.height - row);
+            let k = res_scale();
             enc.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo { texture: &r.tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: row, z: 0 }, aspect: wgpu::TextureAspect::All },
-                wgpu::Extent3d { width: t.width, height: rows, depth_or_array_layers: 1 },
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: row * k, z: 0 }, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: t.width * k, height: rows * k, depth_or_array_layers: 1 },
             );
         }
         self.submit_ordered(enc.finish(), Vec::new());
@@ -3244,7 +3295,7 @@ impl WgpuBackend {
         let out = if swz == 0x688 {
             view.clone()
         } else {
-            let v = self.swizzle(&view, t.width, t.height, swz);
+            let v = self.swizzle(&view, t.width * res_scale(), t.height * res_scale(), swz);
             swizzled.insert(swz, v.clone());
             v
         };
@@ -3261,7 +3312,7 @@ impl WgpuBackend {
         if let Some(v) = r.swizzled.get(&swz) {
             return v.clone();
         }
-        let (src, w, h) = (r.view.clone(), r.w, r.h);
+        let (src, w, h) = (r.view.clone(), r.w * res_scale(), r.h * res_scale());
         let view = self.swizzle(&src, w, h, swz);
         self.resolved.get_mut(&dest).unwrap().swizzled.insert(swz, view.clone());
         view
@@ -3370,6 +3421,9 @@ impl WgpuBackend {
             self.join_encoder(); // ... and submitted, before the compose is (`present_join`)
         }
         let t0 = std::time::Instant::now();
+        // the picture at resolution scale k: k x k pixels per guest pixel (`res_scale`)
+        let k = res_scale();
+        let (w, h) = (w * k, h * k);
         let len = (w * h * 4) as u64;
         let (dst, read) = match self.present_bufs.iter().position(|b| b.0 == len) {
             Some(i) => {
@@ -3401,9 +3455,9 @@ impl WgpuBackend {
         }
         let mut enc = self.device.create_command_encoder(&Default::default());
         for (row, rows, view, _) in draw.iter().map(|&i| &parts[i]) {
-            let rows = (*rows).min(h - row);
+            let (row, rows) = (row * k, (*rows * k).min(h - row * k));
             let ubuf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("present params"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            self.queue.write_buffer(&ubuf, 0, &[w, rows, t.swizzle & 0xFFF, *row].iter().flat_map(|v: &u32| v.to_le_bytes()).collect::<Vec<u8>>());
+            self.queue.write_buffer(&ubuf, 0, &[w, rows, t.swizzle & 0xFFF, row].iter().flat_map(|v: &u32| v.to_le_bytes()).collect::<Vec<u8>>());
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.present_pipe.get_bind_group_layout(0),
@@ -3587,7 +3641,7 @@ impl WgpuBackend {
                     enc.copy_buffer_to_buffer(&r.src, (s - r.dest) as u64, &dst, (from as u32 + (s - lo)) as u64, (e - s) as u64);
                 }
             }
-            let params: [u32; 12] = [x0, y0, x1, y1, dpitch, dheight, pitch_aligned, dinfo & 7, (dinfo >> 24) & 1, 0, 0, 0];
+            let params: [u32; 12] = [x0, y0, x1, y1, dpitch, dheight, pitch_aligned, dinfo & 7, (dinfo >> 24) & 1, res_scale(), 0, 0];
             let pbuf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("resolve params"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             self.queue.write_buffer(&pbuf, 0, &params.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
             // the texels written, for draws that sample this resolve before it reaches guest memory
@@ -3613,7 +3667,7 @@ impl WgpuBackend {
             let alias = Some(if let Some((tex, view, _)) = reuse { (tex, view) } else {
                 let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("resolved texture"),
-                    size: wgpu::Extent3d { width: aw, height: ah, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d { width: aw * res_scale(), height: ah * res_scale(), depth_or_array_layers: 1 },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -3691,7 +3745,8 @@ impl WgpuBackend {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
+            let [x, y, w, h] = scaled_rect(x0, y0, x1 - x0, y1 - y0, res_scale());
+            pass.set_scissor_rect(x, y, w, h);
             pass.set_pipeline(&self.color_fill[&fill_key]);
             pass.set_vertex_buffer(0, vbuf.slice(..));
             pass.draw(0..3, 0..1);
@@ -4147,6 +4202,7 @@ mod tests {
         validate("passthrough vs (trimmed, none)", &passthrough_vs_trimmed(0));
         validate("depth-only ps", DEPTH_ONLY_PS);
         validate("resolve", RESOLVE_CS);
+        validate("resolve 2x", &resolve_cs_msaa());
         validate("colour fill", COLOR_FILL);
         validate("swizzle", SWIZZLE_CS);
         validate("present", PRESENT_CS);
@@ -4366,6 +4422,18 @@ mod land_tests {
 
     /// LMA_LAND_HASH picks the landing check; unset, Windows hashes (its write watch makes the
     /// landing copy fault page by page) and other platforms watch (#304).
+    /// A guest rectangle at 1x and 2x: the same pixels, bands meet without a seam.
+    #[test]
+    fn scaled_rect_covers_the_same_guest_pixels() {
+        assert_eq!(scaled_rect(10, 20, 30, 40, 1), [10, 20, 30, 40], "1x: unchanged");
+        assert_eq!(scaled_rect(10, 20, 30, 40, 2), [20, 40, 60, 80]);
+        // the lower EDRAM tile at 2x ends where the 1x one does, doubled: no seam between bands
+        let a = scaled_rect(0, 0, 1280, 384, 2);
+        let b = scaled_rect(0, 384, 1280, 336, 2);
+        assert_eq!(a[1] + a[3], b[1]);
+        assert_eq!(b[1] + b[3], 1440);
+    }
+
     /// A resolve reuses the texture at its dest only at the same size and format; a setup that
     /// samples it through the identity view follows the texture, a swizzled copy the content.
     #[test]
