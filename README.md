@@ -15,11 +15,25 @@ macOS (Apple Silicon and Intel) and Linux, from your own copy of the game.
 - Modding: the game's database (players, clubs, squads, names, badges) and 50+ of its rules (wages,
   transfers, prize money, player development, substitutions) can be changed by name. See
   [MODS.md](MODS.md).
-- Releases are source only: one command builds the game from your own disc (below). A download
-  that recompiles from your disc at first run is planned.
+- No game code or files in any download: the game is built from your own disc on your machine.
 
 See [lma-rs/PORT_PLAN.md](lma-rs/PORT_PLAN.md) for the architecture and
 [docs/NATIVE_GAME.md](docs/NATIVE_GAME.md) for the plan towards fully readable code.
+
+## Play on a Mac (no commands)
+
+1. Download `lma-<version>-mac-arm64-app.zip` from the [latest release](../../releases/latest)
+   (Apple Silicon, macOS 12 or later), unzip it, drag **LMA.app** to Applications and open it.
+   If macOS says it can't check the app: System Settings > Privacy & Security > **Open Anyway**.
+2. Press Enter (or click) and choose your LMA Manager 2007 (Xbox 360) disc image (`.iso`), or drop
+   it onto the window.
+3. Wait while it sets itself up, with a progress bar per step: it copies the game files from your
+   disc, downloads the Rust compiler once (into the app's own folder), recompiles the game's code
+   and builds it for your Mac (about 15-30 minutes, internet needed once). If macOS asks to install
+   the "command line developer tools", press Install, then Enter in the app.
+4. The game starts; from then on LMA.app opens straight into it.
+
+A Windows download is planned; on Windows and Linux build from source for now (below).
 
 ## Building
 
